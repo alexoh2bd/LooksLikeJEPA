@@ -1,8 +1,9 @@
 /venv
 /wandb
 /outputs
-*/__pycache__
+/eval/__pycache__
 /data/
 /logs
 /cache
 /env
+g
