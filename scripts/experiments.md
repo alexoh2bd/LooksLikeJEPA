@@ -103,3 +103,25 @@ Global, no Local
   +device=cuda \
   +prefetch_factor=4 \
   +view_selection=random
+
+
+# Mixed 8 Local Views 4/8 different Image, Same Class
+./run_inf.sh python eval/views_vit.py \
+  +lamb=0.05 \
+  +V_global=2 \
+  +V_local=4 \
+  +V_mixed=4 \
+  +model_name=vit_base_patch16_224.dino \
+  +save_prefix=vit_cross_instance \
+  +global_img_size=224 \
+  +local_img_size=96 \
+  +proj_dim=512 \
+  +lr=5e-4 \
+  +bs=256 \
+  +epochs=100 \
+  +num_workers=4 \
+  +device=cuda \
+  +prefetch_factor=4 \
+  +view_selection=mixed \ 
+  +benchmark=False \ 
+  +dataset=cifar10

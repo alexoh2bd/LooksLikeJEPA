@@ -31,7 +31,7 @@ python --version
 # Run training
 export HYDRA_FULL_ERROR=1
 
-./run_inf.sh python eval/mamf_bench.py
+# ./run_inf.sh python eval/mamf_bench.py
 
 ./run_inf.sh nsys profile \
   --trace=cuda,osrt,nvtx \

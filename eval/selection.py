@@ -11,7 +11,7 @@ def select_laplacian_views(local_views, n_select=4):
     """
     Select n_select views with high information AND diversity
     """
-    scores = [laplacian_variance(np.array(v)) for v in local_views]
+    scores = [laplacian_variance(v) for v in local_views]
     
     # Get indices of top n_select views
     top_indices = np.argsort(scores)[-n_select:][::-1]
