@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torchvision.transforms import v2
 from torch.amp import autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from abc import  abstractmethod
+from torch.optim.swa_utils import AveragedModel
+from abc import abstractmethod
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field
 import logging
@@ -31,32 +32,38 @@ logging.basicConfig(level=logging.INFO)
 
 @dataclass
 class TrainerConfig:
-    """Configuration for the trainer."""
-    # Model
-    model_name: str = "vit_base_patch16_224.dino"
+    """Configuration for the LeJEPA pretraining pipeline.
+
+    Hyper-parameter ranges for cross-validation (Section 6.1):
+        LR  : {5e-3, 5e-4}   – linear warm-up + cosine annealing
+        WD  : {1e-1, 1e-2, 1e-5} – held *constant* (no schedule)
+        BS  : >= 128 (stable even at 128)
+    """
+    # Model  (paper: ViT-L ~304M or ConvNeXtV2-H ~660M)
+    model_name: str = "vit_large_patch16_224"
     proj_dim: int = 512
     
     # Training
     bs: int = 256
     epochs: int = 100
-    lr: float = 1e-3
-    weight_decay: float = 5e-2
+    lr: float = 5e-4
+    weight_decay: float = 1e-2           
     grad_accum: int = 1
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 3.0
     seed: int = 0
     reg: str = "LeJEPA"
     
-    # Data
-    dataset: str = "inet100"
+    # Data  (paper: ImageNet-1K, 100 epochs)
+    dataset: str = "imagenet-1k"
     num_workers: int = 4
     prefetch_factor: int = 2
     
-    # Views
+    # Views  (paper: V=8 total — 2 global 224×224 + 6 local 98×98)
     V_global: int = 2
-    V_local: int = 4
-    V_mixed: int = 1
+    V_local: int = 6
+    V_mixed: int = 0
     global_img_size: int = 224
-    local_img_size: int = 96
+    local_img_size: int = 98
     
     # Device
     device: str = "cuda"
@@ -64,6 +71,9 @@ class TrainerConfig:
     # Logging
     log_interval: int = 50
     save_interval: int = 50  # epochs
+
+    # SWA (optional, small boost for ViT – Section 6.1)
+    use_swa: bool = False
     
     # DDP placeholders (to be set by distributed setup)
     rank: int = 0
@@ -71,37 +81,34 @@ class TrainerConfig:
     distributed: bool = False
     world_size: int = 1
 
-  
-
-
-
     @classmethod
     def from_hydra(cls, cfg) -> "TrainerConfig":
         """Create config from Hydra DictConfig."""
         return cls(
-            model_name=cfg.get("model_name", "vit_base_patch16_224.dino"),
+            model_name=cfg.get("model_name", "vit_large_patch16_224"),
             proj_dim=cfg.get("proj_dim", 512),
             bs=cfg.get("bs", 256),
             epochs=cfg.get("epochs", 100),
-            lr=cfg.get("lr", 1e-3),
-            weight_decay=cfg.get("weight_decay", 5e-2),
+            lr=cfg.get("lr", 5e-4),
+            weight_decay=cfg.get("weight_decay", 1e-2),
             grad_accum=cfg.get("grad_accum", 1),
-            max_grad_norm=cfg.get("max_grad_norm", 1.0),
-            dataset=cfg.get("dataset", "inet100"),
+            max_grad_norm=cfg.get("max_grad_norm", 3.0),
+            dataset=cfg.get("dataset", "imagenet-1k"),
             num_workers=cfg.get("num_workers", 4),
             prefetch_factor=cfg.get("prefetch_factor", 2),
             V_global=cfg.get("V_global", 2),
-            V_local=cfg.get("V_local", 4),
+            V_local=cfg.get("V_local", 6),
             V_mixed=cfg.get("V_mixed", 0),
             global_img_size=cfg.get("global_img_size", 224),
-            local_img_size=cfg.get("local_img_size", 96),
+            local_img_size=cfg.get("local_img_size", 98),
             device=cfg.get("device", "cuda"),
             log_interval=cfg.get("log_interval", 50),
             save_interval=cfg.get("save_interval", 50),
-            reg = cfg.get("reg", "LeJEPA"),
+            reg=cfg.get("reg", "LeJEPA"),
             distributed=cfg.get("distributed", False),
             world_size=cfg.get("world_size", 1),
-            seed = cfg.get("seed", 0),
+            seed=cfg.get("seed", 0),
+            use_swa=cfg.get("use_swa", False),
         )
 
 
@@ -141,8 +148,12 @@ class BaseTrainer(L.LightningModule):
             mode="default",
             fullgraph=False,
         )
-        # self.effective_bs = config.batch_size
-        # self.real_bs =config.batch_size // (config.grad_accum * config.)
+
+        # Optional SWA encoder for producing stable target embeddings (z̄).
+        # Only the averaged parameters are used; no gradients flow through it.
+        self.use_swa = config.use_swa
+        if self.use_swa:
+            self.swa_encoder = AveragedModel(encoder)
         
         # Augmentations (no .to(device) - Lightning moves these automatically)
         self.gpu_aug_global = self._build_gpu_aug_global()
@@ -229,7 +240,12 @@ class BaseTrainer(L.LightningModule):
     def _build_probe(self) -> nn.Module:
         """Build the linear probe for evaluation."""
         feat_dim = self.encoder.feat_dim
-        num_classes = 100 if self.config.dataset == "inet100" else 10
+        ds = self.config.dataset
+        num_classes = {
+            "imagenet-1k": 1000,
+            "inet100": 100,
+            "cifar10": 10,
+        }.get(ds, 1000)
         
         probe = nn.Sequential(
             nn.LayerNorm(feat_dim),
@@ -276,11 +292,12 @@ class BaseTrainer(L.LightningModule):
         """Lightning hook for validation dataloader."""
         if self.test_ds is None:
             raise RuntimeError("setup() must be called before val_dataloader()")
-        
+
         return DataLoader(
             self.test_ds,
             batch_size=self.per_device_batch_size,
             shuffle=False,
+            drop_last=self.config.distributed,
             num_workers=self.config.num_workers,
             pin_memory=True,
             persistent_workers=self.config.num_workers > 0,
@@ -292,8 +309,8 @@ class BaseTrainer(L.LightningModule):
         return v2.Compose([
             v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
             v2.RandomGrayscale(p=0.2),
-            v2.RandomApply([v2.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.1),
-            v2.RandomApply([v2.RandomSolarize(threshold=0.5)], p=0.2),
+            v2.RandomApply([v2.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5),
+            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
             v2.ToDtype(torch.bfloat16, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
@@ -304,14 +321,18 @@ class BaseTrainer(L.LightningModule):
             v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
             v2.RandomGrayscale(p=0.2),
             v2.RandomApply([v2.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0))], p=0.5),
+            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
+
             v2.ToDtype(torch.bfloat16, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     
     def configure_optimizers(self):
-        """Lightning hook for optimizer configuration."""
-        # Use single optimizer with parameter groups to support automatic optimization
-        # and gradient clipping while having different learning rates
+        """AdamW with linear warm-up + cosine annealing on LR only.
+
+        Weight decay is held constant (no schedule) per paper Section 6.1.
+        Cross-validate LR in {5e-3, 5e-4} and WD in {1e-1, 1e-2, 1e-5}.
+        """
         optimizer = torch.optim.AdamW([
             {
                 'params': self.encoder.parameters(),
@@ -327,10 +348,10 @@ class BaseTrainer(L.LightningModule):
             }
         ])
         
-        # Match run_JEPA.py scheduler: 1-epoch linear warmup + cosine decay
-        # Calculate steps per epoch (accounting for gradient accumulation)
-        steps_per_epoch = len(self.train_ds) // self.per_device_batch_size // self.config.grad_accum
-        warmup_steps = steps_per_epoch  # 1 epoch warmup
+        steps_per_epoch = (
+            len(self.train_ds) // self.config.bs // self.config.grad_accum
+        )
+        warmup_steps = steps_per_epoch * 10  # 10 epoch warmup
         total_steps = steps_per_epoch * self.trainer.max_epochs
         
         warmup_scheduler = LinearLR(
@@ -353,7 +374,7 @@ class BaseTrainer(L.LightningModule):
             'optimizer': optimizer, 
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'interval': 'step',  # Step every batch, not epoch
+                'interval': 'step',
             }
         }
     
@@ -398,10 +419,12 @@ class BaseTrainer(L.LightningModule):
     
     def on_validation_epoch_end(self):
         """Compute additional metrics at end of validation."""
-        # Note: In Lightning, gathering outputs across batches is more complex
-        # For simplicity, we'll skip the detailed metrics for now
-        # You can implement this using self.trainer.callback_metrics if needed
         pass
+
+    def on_train_epoch_end(self):
+        """Update SWA model at the end of each training epoch."""
+        if self.use_swa:
+            self.swa_encoder.update_parameters(self.encoder)
     
     def on_save_checkpoint(self, checkpoint):
         """Lightning hook for saving additional state."""
@@ -412,7 +435,13 @@ class BaseTrainer(L.LightningModule):
 # ========== Concrete Trainer Implementations ==========
 
 class JEPATrainer(BaseTrainer):
-    """Trainer for LeJEPA / SIGReg based methods."""
+    """Trainer for LeJEPA / SIGReg based methods.
+
+    Architecture rules (paper Section 6.1):
+      - No explicit predictor network — representations compared directly.
+      - No register tokens (handled in Encoder).
+      - Optional SWA on the encoder for target embeddings z̄ (handled in BaseTrainer).
+    """
     
     def __init__(
         self,
@@ -441,19 +470,22 @@ class JEPATrainer(BaseTrainer):
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
         
-        # Gather across GPUs if using DDP (Lightning auto-detects)
-        if self.config.distributed and self.config.reg in ("hybrid", "weighted_hybrid"):
+        if self.config.distributed:
             gathered_proj = self.all_gather(all_proj, sync_grads=True)
-            gathered_emb = self.all_gather(all_emb, sync_grads=True)  # ADD THIS
+            gathered_emb = self.all_gather(all_emb, sync_grads=True)
             all_proj = gathered_proj.flatten(0, 1)
-            all_emb = gathered_emb.flatten(0, 1)  # ADD THIS
+            all_emb = gathered_emb.flatten(0, 1)
             labels = self.all_gather(labels, sync_grads=False).flatten(0, 1)
 
-        # Now all_emb, all_proj, and labels are all consistent
-        global_proj = all_proj[:, :self.config.V_global, :] # Vg
-        
+        global_proj = all_proj[:, :self.config.V_global, :]
 
-        # Get global step (Lightning provides this)
+        # Optionally compute SWA target for more stable global centre
+        swa_target = None
+        if self.use_swa:
+            with torch.no_grad():
+                _, swa_proj = self.swa_encoder(global_views)
+                swa_target = swa_proj.mean(dim=1, keepdim=True)  # (N, 1, D)
+
         if self.config.reg == "weighted_hybrid":
             ssl_loss, lejepa_loss, cl_loss, sigreg_loss = weighted_hybrid(
                 global_proj, all_proj, self.sigreg, w=self.w, lamb=self.lamb
@@ -461,8 +493,9 @@ class JEPATrainer(BaseTrainer):
             pred_loss = lejepa_loss
         else:
             ssl_loss, pred_loss, sigreg_loss = LeJEPA(
-                global_proj, all_proj, self.sigreg, self.lamb,
-                losstype=self.config.reg, 
+                all_proj, self.config.V_global, self.sigreg, self.lamb, reg=self.config.reg,
+                target=swa_target,
+                global_step=self.global_step,
             )
             cl_loss = torch.tensor(0.0, device=all_proj.device)
 
@@ -554,7 +587,7 @@ class LpJEPATrainer(BaseTrainer):
         global_proj = all_proj[:, :self.config.V_global, :]
         local_proj = all_proj[:, self.config.V_global:, :]
 
-        # z1 = global center, z2 = local  —  (N,1, D) (N, Vl, D)
+        # z1 = global center, z2 = local  —  (N, 1, D) (N, Vl, D)
         z1 = global_proj.mean(dim=1,keepdim=True)
         z2 = local_proj
 

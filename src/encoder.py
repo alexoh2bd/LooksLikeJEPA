@@ -3,44 +3,49 @@ import torch.nn as nn
 import timm
 from torchvision.ops import MLP
 
+# ── Paper model presets (Table 2) ───────────────────────────────────────────
+MODEL_VIT_L = "vit_large_patch16_224"        # ~304M params
+MODEL_CONVNEXTV2_H = "convnextv2_huge"      # ~660M params
+
+
+def _is_vit(name: str) -> bool:
+    return name.startswith("vit")
+
 
 class Encoder(nn.Module):
     """
-    Encoder for ViT.
+    Backbone + projection head for LeJEPA.
+
+    Supports both Vision-Transformer and ConvNeXt families from timm.
+    ViT-specific options (dynamic_img_size, reg_tokens) are applied only
+    when the backbone is a ViT variant.
     """
-    def __init__(self, model_name="vit_large_patch16_dinov3.sat493m", proj_dim=512):
+    def __init__(self, model_name=MODEL_VIT_L, proj_dim=512):
         super().__init__()
         
         cfg = {
             "pretrained": False,
             "num_classes": 0,
             "drop_path_rate": 0.1,
-            "dynamic_img_size": True if model_name.startswith("vit") else False
         }
 
+        if _is_vit(model_name):
+            cfg["dynamic_img_size"] = True
+            cfg["reg_tokens"] = 0  # paper: no register tokens
 
-        self.backbone = timm.create_model(
-            model_name,
-            **cfg,
-        )
-
-        # Memory optimization: Enable gradient checkpointing to trade compute for memory
-        # Saves ~20-40 GB by not storing all intermediate activations
+        self.backbone = timm.create_model(model_name, **cfg)
         self.backbone.set_grad_checkpointing(True)
 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-
-        # Convert backbone to bfloat16 BEFORE compiling to avoid dtype mismatch
-        # (conv2d error: "Input type BFloat16 and bias type float should be the same")
-        # self.backbone = self.backbone.to(torch.bfloat16)
         
         self.backbone = torch.compile(
             self.backbone,
-            mode="default",
+            mode="reduce-overhead",
         )
 
         self.feat_dim = self.backbone.num_features
+        # self.proj = nn.Linear(self.feat_dim, proj_dim)
         self.proj = MLP(
             in_channels=self.feat_dim, 
             hidden_channels=[2048, 2048, proj_dim], 

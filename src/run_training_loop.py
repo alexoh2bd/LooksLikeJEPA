@@ -1,9 +1,17 @@
 """
 Lightning-based Training Script for SSL methods (LeJEPA, SimCLR, etc.)
 
-Usage:
-    python eval/run_training_loop.py +bs=256 +epochs=100 +dataset=inet100 ...
+Usage (LeJEPA – Table 2 replication):
+    python src/run_training_loop.py \\
+        +reg=LeJEPA \\
+        +model_name=vit_large_patch16_224 \\
+        +dataset=imagenet-1k \\
+        +epochs=100 +bs=256 \\
+        +lr=5e-4 +weight_decay=1e-2 \\
+        +V_global=2 +V_local=6 +V_mixed=0 \\
+        +lamb=0.05 +use_swa=False
 """
+import os
 import torch
 import logging
 import hydra
@@ -11,7 +19,8 @@ from omegaconf import DictConfig
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
-
+import warnings
+warnings.filterwarnings("ignore", message="Corrupt EXIF data.*", category=UserWarning)
 from trainer import TrainerConfig, SimCLRTrainer, JEPATrainer, LpJEPATrainer
 from encoder import Encoder
 
@@ -73,11 +82,12 @@ def main(cfg: DictConfig):
         )
     else:
         raise ValueError(f"Unknown method: {reg}")
-    save_prefix = f"{model.get_method_name()}_{config.dataset}/LV{config.V_local}_MV{config.V_mixed}_BS{config.bs * config.grad_accum}_e{config.epochs}"
+    save_prefix = f"{model.get_method_name()}_{config.dataset}/LV{config.V_local}_MV{config.V_mixed}_BS{config.bs * config.grad_accum}_e{config.epochs}{'_ddp1' if config.distributed else ''}"
     logging.info(f"save_prefix: {save_prefix}")
+    ckpt_dir=f"data/checkpoints/{save_prefix}"
     # Setup callbacks
     checkpoint_callback = ModelCheckpoint(
-        dirpath=f"data/checkpoints/{save_prefix}",
+        dirpath=ckpt_dir,
         filename="{epoch}-{val/acc:.3f}",
         monitor="val/acc",
         mode="max",
@@ -99,11 +109,12 @@ def main(cfg: DictConfig):
     # Use "auto" for single GPU (avoids DDP overhead), "ddp" for multi-GPU
     world_size = cfg.get("world_size", 1)
     use_ddp = cfg.get("distributed", False) and world_size > 1
-    
+    num_nodes=cfg.get("num_nodes",1)
+    ndevices = world_size //num_nodes
     trainer = L.Trainer(
         max_epochs=config.epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=world_size if use_ddp else 1,
+        devices=ndevices if use_ddp else 1,
         strategy="ddp" if use_ddp else "auto",
         precision="bf16-mixed",
         accumulate_grad_batches=config.grad_accum,
@@ -113,12 +124,15 @@ def main(cfg: DictConfig):
         logger=wandb_logger,
         deterministic=False,  # Disabled: ViT's bicubic upsampling is non-deterministic
         enable_progress_bar=True,
+        num_nodes=num_nodes,
         use_distributed_sampler=use_ddp,
         sync_batchnorm=use_ddp,
     )
-    
+    last_ckpt=f"data/checkpoints/{save_prefix}/last.ckpt"
+
+    torch.serialization.add_safe_globals([TrainerConfig])
     # Train the model
-    trainer.fit(model)
+    trainer.fit(model, ckpt_path=last_ckpt if os.path.exists(last_ckpt) else None)
 
     if checkpoint_callback.best_model_path:
         logging.info(f"Best checkpoint saved to: {checkpoint_callback.best_model_path}")

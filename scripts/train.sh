@@ -4,20 +4,15 @@
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=45G
-#SBATCH --time=48:00:00
-#SBATCH --partition=compsci-gpu
+#SBATCH --cpus-per-task=17
+#SBATCH --mem=80G
+#SBATCH --time=480:00:00
 #SBATCH --gres=gpu:rtx_pro_6000:1
 
-
-# Fail fast
 set -e
 
-# Activate environment
-source /home/users/aho13/jepa_tests/env/bin/activate
+source ${env_activate}
 
-# Optional: debugging
 echo "Running on $(hostname)"
 echo "Running on partition: $SLURM_JOB_PARTITION"
 echo "Job ID: $SLURM_JOB_ID"
@@ -28,35 +23,75 @@ nvidia-smi
 which python
 python --version
 
-# Run training
-export HYDRA_FULL_ERROR=1
 
-# # SimCLR training configuration:
+export HF_DATASETS_OFFLINE=1
+export HYDRA_FULL_ERROR=1
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
+
+# ──────────────────────────────────────────────────────────────
+# LeJEPA – Table 2 replication (ViT-L / IN-1K / 100 epochs)
+#
+# Model:       vit_large_patch16_224   (~304M params)
+# Views:       V=8  (2 global 224×224 + 6 local 96×96)
+# Loss:        (1-λ)·MSE + λ·SIGReg,  λ=0.05
+# SIGReg:      Epps-Pulley, M=1024, 17 knots, domain [-5,5]
+# Optimizer:   AdamW  (betas 0.9, 0.95)
+# LR:          cross-validate {5e-3, 5e-4};  linear warmup + cosine anneal
+# WD:          cross-validate {1e-1, 1e-2, 1e-5};  constant (no schedule)
+# Batch size:  ≥128
+# Architecture: No predictor, no register tokens, optional SWA
+# ──────────────────────────────────────────────────────────────
 srun python src/run_training_loop.py \
-  +lamb=0.05\
+  +reg=LeJEPA \
+  +model_name=vit_large_patch16_224 \
+  +dataset=imagenet-1k \
+  +epochs=100 \
+  +bs=512 \
+  +lr=5e-4 \
+  +weight_decay=1e-2 \
+  +lamb=0.05 \
   +V_global=2 \
-  +V_local=6 \
+  +V_local=4 \
   +V_mixed=2 \
-  +model_name=vit_large_patch16_dinov3.sat493m \
   +global_img_size=224 \
   +local_img_size=96 \
-  +proj_dim=512 \
-  +lr=5e-4 \
-  +bs=512 \
+  +proj_dim=64 \
   +grad_accum=1 \
-  +epochs=100\
-  +num_workers=8\
-  +device=cuda \
+  +num_workers=16 \
   +prefetch_factor=2 \
-  +dataset=imagenet-1k \
+  +device=cuda \
   +distributed=False \
-  +seed=0 \
   +world_size=1 \
+  +seed=0 \
   +log_interval=40 \
-  +reg=hybrid \
-  # +invariance_weight=25.0 \
-  # +rdm_reg_weight=125.0 \
-  # +lp_norm_parameter=2.0 \
-  # +mean_shift_value=0.0 \
-  # +target_distribution=rectified_lp_distribution \
+  +use_swa=False
+
+# ──────────────────────────────────────────────────────────────
+# Uncomment below for ConvNeXtV2-H variant (~660M params).
+# Same hyperparameter search space; SWA is less beneficial here.
+# ──────────────────────────────────────────────────────────────
+# srun python src/run_training_loop.py \
+#   +reg=LeJEPA \
+#   +model_name=convnextv2_huge \
+#   +dataset=imagenet-1k \
+#   +epochs=100 \
+#   +bs=128 \
+#   +lr=5e-4 \
+#   +weight_decay=1e-2 \
+#   +lamb=0.05 \
+#   +V_global=2 \
+#   +V_local=6 \
+#   +V_mixed=0 \
+#   +global_img_size=224 \
+#   +local_img_size=96 \
+#   +proj_dim=512 \
+#   +grad_accum=2 \
+#   +num_workers=8 \
+#   +prefetch_factor=2 \
+#   +device=cuda \
+#   +distributed=False \
+#   +world_size=1 \
+#   +seed=0 \
+#   +log_interval=40 \
+#   +use_swa=False
 

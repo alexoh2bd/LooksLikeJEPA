@@ -67,14 +67,15 @@ class HFDataset(Dataset):
         # 2. Define Transforms
         # Global Views: 224x224
         self.global_transform = v2.Compose([
-            v2.RandomResizedCrop(self.global_img_size, scale=(0.08, 1.0)),
-            v2.RandomHorizontalFlip(),
+            v2.RandomResizedCrop(self.global_img_size, scale=(0.3, 1.0)),
+            v2.RandomHorizontalFlip(p=0.5),
             v2.ToImage(),
         ])
         
         # Local Views: 96x96
         self.local_transform = v2.Compose([
-            v2.RandomResizedCrop(self.local_img_size, scale=(0.05, 0.4)),
+            v2.RandomResizedCrop(self.local_img_size, scale=(0.05, 0.3)),
+            v2.RandomHorizontalFlip(p=0.5),
             v2.ToImage(),
         ])
 
@@ -100,12 +101,13 @@ class HFDataset(Dataset):
             self.inet_dir = "/home/users/aho13/jepa_tests/data/hub/datasets--ILSVRC--imagenet-1k/snapshots/49e2ee26f3810fb5a7536bbf732a7b07389a47b5/data"
             
             filenames = {
-                "train": self.inet_dir + "train*.parquet",
-                "val": self.inet_dir + "validation*.parquet",
-                "test": self.inet_dir + "test*.parquet",
+                "train": self.inet_dir + "/train*.parquet",
+                "val": self.inet_dir + "/validation*.parquet",
+                "test": self.inet_dir + "/test*.parquet",
             }
+            self.ds = load_dataset("parquet", data_files=filenames, split=self.split)
         else:
-            raise ValueError(f"Dataset {self.dataset} not supported")
+            raise ValueError(f"Dataset {dataset} not supported")
 
     def _load_image(self, entry):
         """Helper to handle safe image extraction from row entry."""

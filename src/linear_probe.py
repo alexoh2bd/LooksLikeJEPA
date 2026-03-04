@@ -93,6 +93,22 @@ DATASETS = {
         "test_split": "test",
         "num_classes": 37,
     },
+    "aircraft": {
+        "hf_path": "randall-lab/fgvc-aircraft",
+        "image_key": "image",
+        "label_key": "label",
+        "train_split": "train",
+        "test_split": "test",
+        "num_classes": 100,
+    },
+    "cars": {
+        "hf_path": "tanganke/stanford_cars",
+        "image_key": "image",
+        "label_key": "label",
+        "train_split": "train",
+        "test_split": "test",
+        "num_classes": 196,
+    }
 }
 
 # ---------------------------------------------------------------------------

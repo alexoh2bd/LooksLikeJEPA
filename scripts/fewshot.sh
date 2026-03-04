@@ -7,7 +7,6 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
 #SBATCH --time=24:00:00
-#SBATCH --partition=compsci-gpu
 #SBATCH --gres=gpu:a5000:1
 
 
@@ -15,7 +14,7 @@
 set -e
 
 # Activate environment
-source /home/users/aho13/jepa_tests/env/bin/activate
+source ${env_activate}
 
 # Optional: debugging
 echo "Running on $(hostname)"
@@ -30,7 +29,7 @@ python --version
 
 # Run training
 python src/linear_probe.py \
-    --checkpoint_path data/checkpoints/LeJEPA_inet100_vit_base_patch16_224.dino/LV6\|MV2\|BS256_e100/V6/checkpoint_lastLeJEPA_e99_inet100_6LV.pth \
+    --checkpoint_path data/checkpoints/SimCLR_inet100_vit_base_patch16_224.dino/LV4\|MV0\|BS256_e100/V4/checkpoint_lastSimCLR_e99_inet100_4LV.pth \
     --model_name vit_base_patch16_224.dino \
     --proj_dim 256 \
     --datasets dtd cifar10 cifar100 flowers102 food101 pets \
