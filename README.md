@@ -1,8 +1,13 @@
-# LeJEPA — View-Strategy Experiments
+# Looks Like JEPA!
 
-Self-supervised representation learning with **LeJEPA** and **SIGReg**, exploring the effect of view-selection strategies (random, cross-instance/mixed) on downstream transfer quality.
+Human visual recognition is inherently relational: we identify a cheetah partly because we've already learned what a cat looks like, drawing on similarity between previously encountered objects to make sense of new ones. Standard self-supervised methods like JEPA learn representations from multiple augmented views of a single image, but never explicitly encourage the model to connect representations across semantically related images during pretraining.
+This project investigates whether semantically guided view selection — exposing the model to local views drawn from related but distinct images — produces representations that transfer more effectively to unseen tasks. We explore two strategies:
 
-Training uses a ViT-L backbone, an online linear probe for monitoring, and evaluates via few-shot linear transfer across six standard benchmarks.
+Semantic cross-instance views (SCV): local crops sampled from a different image sharing the same class label as the anchor.
+kP-views (neighbor views): local crops sampled from the anchor's top-k nearest neighbors in a pretrained embedding space (e.g., CLIP), requiring no labels at all.
+
+Both strategies augment the standard LeJEPA training loop: the predictor must reconstruct patch-level representations of views that may originate from a different image than the anchor, encouraging the encoder to build representations grounded in shared semantics rather than low-level pixel statistics.
+We evaluate representation quality through few-shot linear transfer across multiple classification benchmarks (DTD, CIFAR-10/100, Flowers-102, Food-101, Oxford Pets, and others), measuring how well the learned features generalize to data and tasks the model has never seen during pretraining.
 
 **W&B project:** [VIT_JEPA_Views](https://wandb.ai/aho13-duke-university/VIT_JEPA_Views)
 
@@ -95,7 +100,7 @@ uv run src/run_training_loop.py \
   +V_mixed=2 \
   +global_img_size=224 \
   +local_img_size=96 \
-  +proj_dim=64 \
+  +proj_dim=512 \
   +grad_accum=1 \
   +num_workers=16 \
   +prefetch_factor=2 \
@@ -122,7 +127,7 @@ uv run src/run_training_loop.py \
   +V_mixed=2 \
   +global_img_size=224 \
   +local_img_size=96 \
-  +proj_dim=64 \
+  +proj_dim=512 \
   +num_workers=8 \
   +distributed=False \
   +world_size=1 \
@@ -173,7 +178,7 @@ srun --ntasks=4 --ntasks-per-node=4 uv run src/run_training_loop.py \
   +V_mixed=0 \
   +global_img_size=224 \
   +local_img_size=96 \
-  +proj_dim=64 \
+  +proj_dim=512 \
   +grad_accum=1 \
   +num_workers=7 \
   +prefetch_factor=2 \
@@ -201,7 +206,7 @@ srun --ntasks=4 --ntasks-per-node=4 uv run src/run_training_loop.py \
   +V_mixed=0 \
   +global_img_size=224 \
   +local_img_size=96 \
-  +proj_dim=64 \
+  +proj_dim=512 \
   +num_workers=7 \
   +distributed=True \
   +world_size=4 \
@@ -236,7 +241,7 @@ Evaluates a frozen pretrained backbone on six downstream datasets under 1%, 10%,
 uv run python src/linear_probe.py \
   --checkpoint_path data/checkpoints/LeJEPA_imagenet-1k/LV6_MV0_BS512_e100/last.ckpt \
   --model_name vit_large_patch16_224 \
-  --proj_dim 64 \
+  --proj_dim 512 \
   --datasets dtd cifar10 cifar100 flowers102 food101 pets \
   --fractions 0.01 0.10 1.0 \
   --epochs 100 \
@@ -279,7 +284,7 @@ Both Lightning `.ckpt` checkpoints (from `src/run_training_loop.py`) and legacy 
 | `+V_local` | Number of local views (96×96) | 6 |
 | `+V_mixed` | Cross-instance views (same class, different image) | 0 |
 | `+lamb` | SIGReg weight λ in `(1-λ)·pred + λ·SIGReg` | 0.05 |
-| `+proj_dim` | Projection head output dimension | 64 |
+| `+proj_dim` | Projection head output dimension | 512 |
 | `+lr` | Peak learning rate (linear warmup 10 epochs + cosine decay) | 5e-4 |
 | `+weight_decay` | AdamW weight decay (constant, no schedule) | 1e-2 |
 | `+bs` | Total effective batch size across all GPUs | 512 |

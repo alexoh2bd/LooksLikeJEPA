@@ -1,0 +1,52 @@
+# B3-Style LeJEPA Batch Mining Pipeline — Default Configuration
+
+# Teacher model for embedding extraction
+teacher:
+  model_name: "vit_base_patch16_clip_224.openai"
+  checkpoint_path: null          # null = use timm ImageNet-1k pretrained weights
+  embedding_dim: 1024            # vit_large hidden dim; set 768 for vit_base
+  img_size: 224
+  normalize: true                # L2-normalize embeddings before any distance computation
+
+# Data
+data:
+  dataset: "imagenet1k"
+  data_dir: "data/hub/datasets--ILSVRC--imagenet-1k/snapshots/49e2ee26f3810fb5a7536bbf732a7b07389a47b5/data"
+  num_samples: 1281167           # ImageNet-1K train split size
+  num_workers: 8
+  batch_size_inference: 256      # batch size used during Stage 1 embedding extraction
+
+# Rank matrix (Stage 2)
+ranking:
+  top_k: 130                     # retrieve top-130 neighbors per query (p + m = 30 + 100)
+  chunk_size: 32768              # number of queries processed per FAISS call (memory vs speed tradeoff)
+  use_gpu_faiss: true            # move FAISS index to GPU if available
+
+# Graph construction (Stage 3)
+graph:
+  p: 30                          # skip top-p neighbors (false-negative filter)
+  m: 100                         # neighborhood window size; use ranks [p, p+m) as hard negatives
+  symmetric: true                # only add edge (i,j) when j is also in i's window (mutual)
+  use_labels: false              # set true to additionally filter same-class pairs (semi-supervised)
+  labels_path: null              # path to labels .npy if use_labels=true
+
+# Clustering (Stage 4)
+clustering:
+  K: 32                          # target cluster size (samples per cluster)
+  algorithm: "metis"
+  seed: 42
+
+# Batch export (Stage 5)
+batching:
+  batch_size: 256                # total batch size; must be divisible by K
+  num_epochs: 100
+  seed: 42
+
+# Output paths (can be overridden per-stage via --output_dir)
+output:
+  base_dir: "outputs/imagenet1k_b3"
+  embeddings_dir: "outputs/imagenet1k_b3/embeddings"
+  ranks_dir: "outputs/imagenet1k_b3/ranks"
+  graph_dir: "outputs/imagenet1k_b3/graph"
+  clusters_dir: "outputs/imagenet1k_b3/clusters"
+  batches_dir: "outputs/imagenet1k_b3/batches"

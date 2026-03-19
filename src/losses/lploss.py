@@ -20,7 +20,6 @@
 import math
 import torch
 import torch.nn.functional as F
-from losses.misc import gather
 import mpmath as mp
 from torch.distributions.laplace import Laplace
 
@@ -30,6 +29,7 @@ from losses.metrics import (
     variance_loss,
     covariance_loss,
 )
+from losses.misc import gather
 
 # =========================
 # Invariance Loss
@@ -244,14 +244,13 @@ def rectified_lp_jepa_loss(
     Computes the total Rectified LpJEPA loss: Invariance + RDMReg.
     Variance and Covariance terms are logged but never optimized.
     """
-    # 1. Invariance Loss
+    # 1. Invariance Loss (per-sample MSE, fine with per-rank batch)
     sim_loss = invariance_loss(z1, z2)
-    
-    # Gather across GPUs for global statistics
-    z1_gathered, z2_gathered = gather(z1), gather(z2)
-    
-    # 3. RDMReg Loss (Distribution Matching)
-    reg_loss = rdmreg_loss(z1_gathered, z2_gathered, projection_vectors, target_distribution, mean_shift_value, lp_norm_parameter, chosen_sigma)
+
+    # 2. RDMReg: gather across DDP ranks for full-batch distribution matching.
+    # misc.gather supports backward propagation so gradients flow correctly.
+    # z1_gathered, z2_gathered = gather(z1), gather(z2)
+    reg_loss = rdmreg_loss(z1, z2, projection_vectors, target_distribution, mean_shift_value, lp_norm_parameter, chosen_sigma)
     
     # Total weighted loss - Variance and Covariance are logged separately in training_step
     loss = (invariance_loss_weight * sim_loss) + (rdm_reg_loss_weight * reg_loss)

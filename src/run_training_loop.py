@@ -33,24 +33,42 @@ def main(cfg: DictConfig):
     # Set seed for reproducibility
     seed = cfg.get("seed", 0)
     L.seed_everything(seed, workers=True)
-    # In run_training_loop.py, after L.seed_everything():
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False  # Disable for reproducibility
-    # Enable CUDA optimizations
+    reproducible = cfg.get("reproducible", False)
+    if reproducible:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        logging.info("Reproducibility mode: cudnn.deterministic=True, cudnn.benchmark=False")
+    else:
+        torch.backends.cudnn.benchmark = True
+
+    # Enable CUDA optimizations (when not reproducible)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)
+    # torch.backends.cudnn.benchmark = True
+
     
     logging.info(cfg)
     
     # Build config from hydra
     config = TrainerConfig.from_hydra(cfg)
+    config.reproducible = reproducible
     
     # Create encoder
     encoder = Encoder(model_name=config.model_name, proj_dim=config.proj_dim)
-    
+    if cfg.get("phn", False):
+        config.phn_neighbor_indices_path = cfg.get("phn_neighbor_indices_path", "")
+        config.phn_neighbor_scores_path  = cfg.get("phn_neighbor_scores_path", "")
+        config.V_neighbor                = cfg.get("V_neighbor", 2)
+        config.phn_p                     = cfg.get("phn_p", 32)
+        config.phn_min_similarity        = cfg.get("phn_min_similarity", 0.0)
+        config.phn_neighbor_sampling     = cfg.get("phn_neighbor_sampling", "uniform")
+        config.phn_pos_only              = cfg.get("phn_pos_only", False)
+        config.phn_neighbor_start_epoch  = cfg.get("phn_neighbor_start_epoch", 0)
+
+
     # Create model based on method type
     reg = cfg.get("reg", "LeJEPA")
     if reg == "SimCLR" or reg=="SupCon":
@@ -61,6 +79,7 @@ def main(cfg: DictConfig):
             hydra_cfg=cfg,
         )
     elif reg in ("LeJEPA", "hybrid", "weighted_hybrid"):
+        
         model = JEPATrainer(
             encoder=encoder,
             config=config,
@@ -82,7 +101,14 @@ def main(cfg: DictConfig):
         )
     else:
         raise ValueError(f"Unknown method: {reg}")
-    save_prefix = f"{model.get_method_name()}_{config.dataset}/LV{config.V_local}_MV{config.V_mixed}_BS{config.bs * config.grad_accum}_e{config.epochs}{'_ddp1' if config.distributed else ''}"
+    v_neighbor = getattr(config, "V_neighbor", 0)
+    save_prefix = (
+        f"{model.get_method_name()}_{config.dataset}/"
+        f"LV{config.V_local}_MV{config.V_mixed}"
+        + (f"_NV{v_neighbor}_QwenP{config.phn_p}" if v_neighbor else "")
+        + f"_BS{config.bs * config.grad_accum}_e{config.epochs}"
+        + (f"_ddp6" if config.distributed else "") 
+    )
     logging.info(f"save_prefix: {save_prefix}")
     ckpt_dir=f"data/checkpoints/{save_prefix}"
     # Setup callbacks
@@ -101,6 +127,7 @@ def main(cfg: DictConfig):
     # Setup logger
     wandb_logger = WandbLogger(
         project="VIT_JEPA_Views",
+        entity="aho13-duke-university",
         name=save_prefix,
         config=dict(cfg),
     )
@@ -110,11 +137,15 @@ def main(cfg: DictConfig):
     world_size = cfg.get("world_size", 1)
     use_ddp = cfg.get("distributed", False) and world_size > 1
     num_nodes=cfg.get("num_nodes",1)
-    ndevices = world_size //num_nodes
+    ndevices = world_size // num_nodes
+    # phn_pos_only uses PosBatchSampler which handles DDP; do not add DistributedSampler
+    phn_pos_only = cfg.get("phn_pos_only", True)
+    use_dist_sampler = use_ddp and not (cfg.get("phn", False) and phn_pos_only)
     trainer = L.Trainer(
         max_epochs=config.epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=ndevices if use_ddp else 1,
+        check_val_every_n_epoch=4,  # validate every 4 epochs
         strategy="ddp" if use_ddp else "auto",
         precision="bf16-mixed",
         accumulate_grad_batches=config.grad_accum,
@@ -122,10 +153,10 @@ def main(cfg: DictConfig):
         log_every_n_steps=config.log_interval,
         callbacks=[checkpoint_callback, lr_monitor],
         logger=wandb_logger,
-        deterministic=False,  # Disabled: ViT's bicubic upsampling is non-deterministic
+        deterministic=config.reproducible,
         enable_progress_bar=True,
         num_nodes=num_nodes,
-        use_distributed_sampler=use_ddp,
+        use_distributed_sampler=use_dist_sampler,
         sync_batchnorm=use_ddp,
     )
     last_ckpt=f"data/checkpoints/{save_prefix}/last.ckpt"

@@ -45,7 +45,6 @@ class Encoder(nn.Module):
         )
 
         self.feat_dim = self.backbone.num_features
-        # self.proj = nn.Linear(self.feat_dim, proj_dim)
         self.proj = MLP(
             in_channels=self.feat_dim, 
             hidden_channels=[2048, 2048, proj_dim], 
@@ -53,6 +52,7 @@ class Encoder(nn.Module):
         )
         self.proj = torch.compile(self.proj, mode="default")
         self.output_bn = nn.BatchNorm1d(proj_dim, affine=False)
+        self.output_bn = nn.SyncBatchNorm.convert_sync_batchnorm(self.output_bn)
         self.output_bn.float()
 
     def forward(self, x_list, unnorm=False):

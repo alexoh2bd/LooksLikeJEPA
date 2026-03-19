@@ -13,3 +13,5 @@
 /debug*
 *.sqlite
 *.nsys-rep
+*__pycache__
+*.sh

@@ -111,12 +111,10 @@ class HFDataset(Dataset):
 
     def _load_image(self, entry):
         """Helper to handle safe image extraction from row entry."""
-        if "image" in entry:
-            return entry["image"].convert("RGB")
-        elif "img" in entry:
-            return entry["img"].convert("RGB")
-        else:
+        img = entry.get("image") or entry.get("img")
+        if img is None:
             raise ValueError("Image not found in entry")
+        return img if img.mode == "RGB" else img.convert("RGB")
 
     def __getitem__(self, i):
         entry = self.ds[i]

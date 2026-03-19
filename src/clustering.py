@@ -1,3 +1,4 @@
+
 import ast
 import time
 import pandas as pd
@@ -12,7 +13,6 @@ import os
 import random
 import sys
 import argparse
-import numpy as np
 import random
 
 
@@ -35,10 +35,6 @@ def load_preferences(file_path, nmax=1000000, max_count=1000000):
 # Create an adjacency list for the graph
 def create_adjacency_list(preferences, n_candidates):
     edges = []
-    # for i, rank_scores in enumerate(preferences):
-    #     for rank, score in rank_scores:
-    #         if i != rank:  # Avoid self-loops
-    #             edges.append((i, int(rank)))
     for i, rank_scores in tqdm(enumerate(preferences), total=len(preferences), desc="Processing Preferences"):
         for rank in rank_scores:
             if i != rank:  # Avoid self-loops

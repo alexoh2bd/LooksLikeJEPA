@@ -121,9 +121,9 @@ class SIGReg(nn.Module):
         cos_mean = x_t.cos().mean(0)
         sin_mean = x_t.sin().mean(0)
 
-        if dist.is_initialized():
-            cos_mean = all_reduce(cos_mean)
-            sin_mean = all_reduce(sin_mean)
+        # if dist.is_initialized():
+        #     cos_mean = all_reduce(cos_mean)
+        #     sin_mean = all_reduce(sin_mean)
 
 
         # ECF distance calculation
