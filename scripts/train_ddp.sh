@@ -5,7 +5,7 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=40G
+#SBATCH --mem=64G
 #SBATCH --time=320:00:00
 #SBATCH --partition=compsci-gpu
 #SBATCH --gres=gpu:a5000:4
@@ -91,38 +91,6 @@ python --version
 #     - proj_dim=64            (Table 1d best)
 #     - 1024 slices, [-5,5], 17 integration points (your SIGReg defaults)
 # ===========================================================================
-# srun uv run src/run_training_loop.py \
-#   +reg=LeJEPA \
-#   +model_name=vit_large_patch14_224 \
-#   +dataset=imagenet-1k \
-#   +epochs=100 \
-#   +bs=512 \
-#   +lr=5e-4 \
-#   +weight_decay=5e-2 \
-#   +lamb=0.05 \
-#   +V_global=2 \
-#   +V_local=6 \
-#   +V_mixed=0 \
-#   +global_img_size=224 \
-#   +local_img_size=98 \
-#   +proj_dim=512 \
-#   +grad_accum=1 \
-#   +num_workers=7 \
-#   +prefetch_factor=2 \
-#   +device=cuda \
-#   +distributed=True \
-#   +world_size=8 \
-#   +num_nodes=2 \
-#   +seed=0 \
-#   +log_interval=200 \
-#   +use_swa=False
-
-# ===========================================================================
-# Training — PHN (uncomment to run instead of baseline)
-#
-#   Same hyperparameters as baseline, plus neighbor views.
-#   Comment out the baseline srun above and uncomment this block.
-# ===========================================================================
 srun uv run src/run_training_loop.py \
   +reg=LeJEPA \
   +model_name=vit_large_patch14_224 \
@@ -133,14 +101,14 @@ srun uv run src/run_training_loop.py \
   +weight_decay=5e-2 \
   +lamb=0.05 \
   +V_global=2 \
-  +V_local=4 \
-  +V_mixed=0 \
+  +V_local=5 \
+  +V_mixed=1 \
   +global_img_size=224 \
   +local_img_size=98 \
   +proj_dim=512 \
   +grad_accum=1 \
   +num_workers=7 \
-  +prefetch_factor=3 \
+  +prefetch_factor=2 \
   +device=cuda \
   +distributed=True \
   +world_size=8 \
@@ -148,11 +116,48 @@ srun uv run src/run_training_loop.py \
   +seed=0 \
   +log_interval=200 \
   +use_swa=False \
-  +phn=True \
-  +phn_neighbor_indices_path="data/b3/imagenet1k_qwen3_vl/ranks/neighbors.npy" \
-  +phn_neighbor_scores_path="data/b3/imagenet1k_qwen3_vl/ranks/neighbor_scores.npy" \
-  +phn_p=64 \
-  +V_neighbor=2 \
-  +phn_neighbor_sampling="uniform" \
-  +phn_pos_only=False \
-  +phn_neighbor_start_epoch=20
+  +torch_compile=true
+
+# ===========================================================================
+# Training — PHN (uncomment to run instead of baseline)
+#
+#   Same hyperparameters as baseline, plus neighbor views.
+#   Comment out the baseline srun above and uncomment this block.
+# ===========================================================================
+# srun uv run src/run_training_loop.py \
+#   +reg=LeJEPA \
+#   +model_name=vit_large_patch14_224 \
+#   +dataset=imagenet-1k \
+#   +epochs=100 \
+#   +bs=512 \
+#   +lr=5e-4 \
+#   +weight_decay=5e-2 \
+#   +lamb=0.05 \
+#   +V_global=2 \
+#   +V_local=5 \
+#   +V_mixed=0 \
+#   +global_img_size=224 \
+#   +local_img_size=98 \
+#   +proj_dim=512 \
+#   +grad_accum=1 \
+#   +num_workers=7 \
+#   +prefetch_factor=3 \
+#   +device=cuda \
+#   +distributed=True \
+#   +world_size=8 \
+#   +num_nodes=2 \
+#   +seed=0 \
+#   +log_interval=200 \
+#   +use_swa=False \
+#   +phn=True \
+#   +phn_neighbor_indices_path="data/b3/imagenet1k_qwen3_vl/ranks/neighbors.npy" \
+#   +phn_neighbor_scores_path="data/b3/imagenet1k_qwen3_vl/ranks/neighbor_scores.npy" \
+#   +phn_p=64 \
+#   +V_neighbor=1 \
+#   +phn_neighbor_sampling="uniform" \
+#   +phn_pos_only=False \
+#   +phn_neighbor_same_label_only=False
+  # Warmup: 6 self-only locals (auto = V_local+V_neighbor), then 4 self + 2 neighbor.
+  # Override with +phn_warmup_V_local=6 if needed.
+  # phn_neighbor_same_label_only: neighbor pool = top-phn_p teacher ranks ∩ same class as anchor.
+  #   +phn_neighbor_start_epoch=20 \

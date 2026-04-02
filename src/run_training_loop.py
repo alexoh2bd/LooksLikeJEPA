@@ -57,7 +57,11 @@ def main(cfg: DictConfig):
     config.reproducible = reproducible
     
     # Create encoder
-    encoder = Encoder(model_name=config.model_name, proj_dim=config.proj_dim)
+    encoder = Encoder(
+        model_name=config.model_name,
+        proj_dim=config.proj_dim,
+        torch_compile=config.torch_compile,
+    )
     if cfg.get("phn", False):
         config.phn_neighbor_indices_path = cfg.get("phn_neighbor_indices_path", "")
         config.phn_neighbor_scores_path  = cfg.get("phn_neighbor_scores_path", "")
@@ -67,6 +71,10 @@ def main(cfg: DictConfig):
         config.phn_neighbor_sampling     = cfg.get("phn_neighbor_sampling", "uniform")
         config.phn_pos_only              = cfg.get("phn_pos_only", False)
         config.phn_neighbor_start_epoch  = cfg.get("phn_neighbor_start_epoch", 0)
+        config.phn_warmup_V_local        = cfg.get("phn_warmup_V_local", None)
+        config.phn_neighbor_same_label_only = cfg.get(
+            "phn_neighbor_same_label_only", False
+        )
 
 
     # Create model based on method type
@@ -107,7 +115,7 @@ def main(cfg: DictConfig):
         f"LV{config.V_local}_MV{config.V_mixed}"
         + (f"_NV{v_neighbor}_QwenP{config.phn_p}" if v_neighbor else "")
         + f"_BS{config.bs * config.grad_accum}_e{config.epochs}"
-        + (f"_ddp6" if config.distributed else "") 
+        + (f"_ddp8" if config.distributed else "")
     )
     logging.info(f"save_prefix: {save_prefix}")
     ckpt_dir=f"data/checkpoints/{save_prefix}"
@@ -149,7 +157,6 @@ def main(cfg: DictConfig):
         strategy="ddp" if use_ddp else "auto",
         precision="bf16-mixed",
         accumulate_grad_batches=config.grad_accum,
-        gradient_clip_val=config.max_grad_norm,
         log_every_n_steps=config.log_interval,
         callbacks=[checkpoint_callback, lr_monitor],
         logger=wandb_logger,
@@ -159,11 +166,15 @@ def main(cfg: DictConfig):
         use_distributed_sampler=use_dist_sampler,
         sync_batchnorm=use_ddp,
     )
-    last_ckpt=f"data/checkpoints/{save_prefix}/last.ckpt"
+    last_ckpt = f"data/checkpoints/{save_prefix}/last.ckpt"
+    init_ckpt = cfg.get("init_ckpt", None)
+    resume_ckpt = init_ckpt or (last_ckpt if os.path.exists(last_ckpt) else None)
+    if resume_ckpt:
+        logging.info("Resuming from checkpoint: %s", resume_ckpt)
 
     torch.serialization.add_safe_globals([TrainerConfig])
     # Train the model
-    trainer.fit(model, ckpt_path=last_ckpt if os.path.exists(last_ckpt) else None)
+    trainer.fit(model, ckpt_path=resume_ckpt)
 
     if checkpoint_callback.best_model_path:
         logging.info(f"Best checkpoint saved to: {checkpoint_callback.best_model_path}")

@@ -29,7 +29,7 @@ from stats import RepresentationMetrics
 from save import save_checkpoint
 from ds import HFDataset, CrossInstanceDataset, collate_views
 from neighbor_index import NeighborIndex
-from mixed_view_ds import MixedViewDataset, collate_mixed_views
+from mixed_view_ds import NeighborViewDataset, collate_mixed_views
 from pipeline.batch_sampler import PosBatchSampler
 from losses.misc import gather
 
@@ -102,6 +102,9 @@ class TrainerConfig:
 
     # Reproducibility (slower; use for debugging or exact replication)
     reproducible: bool = False
+
+    # torch.compile (encoder + probe); set False to avoid Inductor/Triton issues or nested compile
+    torch_compile: bool = True
     
     # DDP placeholders (to be set by distributed setup)
     rank: int = 0
@@ -138,6 +141,7 @@ class TrainerConfig:
             seed=cfg.get("seed", 0),
             use_swa=cfg.get("use_swa", False),
             reproducible=cfg.get("reproducible", False),
+            torch_compile=cfg.get("torch_compile", True),
         )
 
 
@@ -167,16 +171,10 @@ class BaseTrainer(L.LightningModule):
         # Models (no .to(device) - Lightning handles this)
         self.encoder = encoder
         self.probe = self._build_probe()
-        self.encoder = torch.compile(
-            self.encoder,
-            mode="default",
-            fullgraph=False,
-        )
-        self.probe = torch.compile(
-            self.probe,
-            mode="default",
-            fullgraph=False,
-        )
+
+        if config.torch_compile:
+            self.encoder = torch.compile(self.encoder, mode="default", fullgraph=False)
+            self.probe = torch.compile(self.probe, mode="default", fullgraph=False)
 
         # Optional SWA encoder for producing stable target embeddings (z̄).
         # Only the averaged parameters are used; no gradients flow through it.
@@ -199,7 +197,29 @@ class BaseTrainer(L.LightningModule):
         self.test_ds = None
         self._phn_dataset = None
         self._phn_sampler = None
-            
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Soft checkpoint loading: checkpoint weights win; model keys absent from the
+        checkpoint keep their initialised values; unexpected checkpoint keys are ignored.
+        This allows resuming across minor architecture changes (e.g. a dormant module
+        added after the checkpoint was saved, such as output_bn)."""
+        ckpt_sd = checkpoint["state_dict"]
+        model_sd = self.state_dict()
+        merged = {**model_sd, **{k: v for k, v in ckpt_sd.items() if k in model_sd}}
+        missing = [k for k in model_sd if k not in ckpt_sd]
+        extra   = [k for k in ckpt_sd  if k not in model_sd]
+        if missing or extra:
+            logging.warning(
+                "on_load_checkpoint: %d missing keys (keeping init values), "
+                "%d unexpected keys (ignored) — likely a benign architecture delta.",
+                len(missing), len(extra),
+            )
+            if missing:
+                logging.warning("  missing: %s", missing[:8])
+            if extra:
+                logging.warning("  extra:   %s", extra[:8])
+        checkpoint["state_dict"] = merged
+
     @abstractmethod
     def compute_loss(
         self,
@@ -231,7 +251,7 @@ class BaseTrainer(L.LightningModule):
         """Lightning hook called at the beginning of fit/test.
 
         Priority for training dataset:
-          1. PHN (neighbor views) → MixedViewDataset
+          1. PHN (neighbor views) → NeighborViewDataset
           2. Mixed/cross-instance  → CrossInstanceDataset
           3. Default               → HFDataset
         """
@@ -256,7 +276,7 @@ class BaseTrainer(L.LightningModule):
                 nbr_idx.tolist(),
                 [f"{s:.4f}" for s in nbr_sim.tolist()],
             )
-            self.train_ds = MixedViewDataset(
+            self.train_ds = NeighborViewDataset(
                 split="train",
                 neighbor_index=neighbor_index,
                 V_global=cfg.V_global,
@@ -266,10 +286,14 @@ class BaseTrainer(L.LightningModule):
                 min_similarity=getattr(cfg, "phn_min_similarity", 0.0),
                 neighbor_sampling=getattr(cfg, "phn_neighbor_sampling", "uniform"),
                 neighbor_start_epoch=getattr(cfg, "phn_neighbor_start_epoch", 0),
+                warmup_V_self=getattr(cfg, "phn_warmup_V_local", None),
                 global_img_size=cfg.global_img_size,
                 local_img_size=cfg.local_img_size,
                 dataset=cfg.dataset,
                 seed=cfg.seed,
+                neighbor_same_label_only=getattr(
+                    cfg, "phn_neighbor_same_label_only", False
+                ),
             )
             self._phn_dataset = self.train_ds
             # Cross-check: do image 0's neighbors have the same label?
@@ -450,8 +474,12 @@ class BaseTrainer(L.LightningModule):
             start_epoch = getattr(self.config, "phn_neighbor_start_epoch", 0)
             if start_epoch > 0 and self.current_epoch == start_epoch:
                 logging.info(
-                    "PHN curriculum: introducing neighbor views at epoch %d",
+                    "PHN curriculum: epoch %d → %d self + %d neighbor local views "
+                    "(warmup was %d self-only)",
                     self.current_epoch,
+                    getattr(self.train_ds, "V_self", self.config.V_local),
+                    getattr(self.train_ds, "V_neighbor", 0),
+                    getattr(self.train_ds, "V_self_warmup", self.config.V_local),
                 )
                 # Save model weights at transition (pure self-view checkpoint)
                 if self.trainer.is_global_zero:
@@ -482,7 +510,7 @@ class BaseTrainer(L.LightningModule):
         return v2.Compose([
             v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
             v2.RandomGrayscale(p=0.2),
-            v2.RandomApply([v2.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0))], p=0.5),
+            v2.RandomApply([v2.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5),
             v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
 
             v2.ToDtype(torch.bfloat16, scale=True),
@@ -502,13 +530,13 @@ class BaseTrainer(L.LightningModule):
                 'params': self.encoder.parameters(),
                 'lr': self.config.lr,
                 'weight_decay': wd,
-                'betas': (0.9, 0.95),
+                'betas': (0.9, 0.999),
             },
             {
                 'params': self.probe.parameters(),
                 'lr': 3e-3,
                 'weight_decay': 0.0,
-                'betas': (0.9, 0.95),
+                'betas': (0.9, 0.999),
             }
         ])
         

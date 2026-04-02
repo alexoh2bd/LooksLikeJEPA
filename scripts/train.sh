@@ -16,6 +16,13 @@ set -e
 
 source /home/users/aho13/jepa_tests/.venv/bin/activate
 
+# Project root: Slurm copies this script to a spool path, so prefer submit dir.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  cd "$SLURM_SUBMIT_DIR" || exit 1
+else
+  SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  cd "$SCRIPT_DIR/.." || exit 1
+fi
 
 echo "Running on $(hostname)"
 echo "Running on partition: $SLURM_JOB_PARTITION"
@@ -52,11 +59,9 @@ P=64
 # phn_pos_only=False: use PosHardNegBatchSampler with K-sized clusters
 PHN_POS_ONLY=true
 
+# ── Active run: LpJEPA + PHN ─────────────────────────────────────────
 srun uv run python src/run_training_loop.py \
-  +reg=LpJEPA \
-  +lp_norm_parameter=1.0 \
-  +mean_shift_value=0.0 \
-  +target_distribution=lp_distribution \
+  +reg=LeJEPA \
   +model_name=vit_base_patch16_224.dino \
   +dataset=inet100 \
   +epochs=100 \
@@ -65,53 +70,65 @@ srun uv run python src/run_training_loop.py \
   +weight_decay=5e-2 \
   +lamb=0.05 \
   +V_global=2 \
-  +V_local=4 \
-  +V_neighbor=2 \
+  +V_local=5 \
+  +V_mixed=1 \
   +global_img_size=224 \
   +local_img_size=96 \
   +proj_dim=512 \
   +grad_accum=1 \
   +num_workers=5 \
-  +prefetch_factor=1 \
+  +prefetch_factor=2 \
   +device=cuda \
   +distributed=False \
   +world_size=1 \
   +seed=0 \
   +log_interval=40 \
-  +use_swa=False \
-  +phn=True \
-  +phn_p=$P \
-  +phn_pos_only=$PHN_POS_ONLY \
-  +phn_neighbor_indices_path="data/b3/imagenet100_b3_P32B32/ranks/neighbors.npy" \
-  +phn_neighbor_scores_path="data/b3/imagenet100_b3_P32B32/ranks/neighbor_scores.npy" \
-  +phn_neighbor_sampling="uniform" 
+  # +V_neighbor=1 \
 
-# ──────────────────────────────────────────────────────────────
-# Uncomment below for ConvNeXtV2-H variant (~660M params).
-# Same hyperparameter search space; SWA is less beneficial here.
-# ──────────────────────────────────────────────────────────────
-# srun python src/run_training_loop.py \
+  # +use_swa=False \
+  # +phn=True \
+  # +phn_p=$P \
+  # +phn_pos_only=$PHN_POS_ONLY \
+  # +phn_neighbor_indices_path="data/b3/imagenet100_b3_P32B32/ranks/neighbors.npy" \
+  # +phn_neighbor_scores_path="data/b3/imagenet100_b3_P32B32/ranks/neighbor_scores.npy" \
+  # +phn_neighbor_sampling="weighted" \
+  # +torch_compile=True
+
+
+
+# ── Alternative: LeJEPA + PHN (uncomment to use) ──────────────────────
+# srun uv run python src/run_training_loop.py \
 #   +reg=LeJEPA \
-#   +model_name= \
-#   +dataset=imagenet-1k \
+#   +model_name=vit_base_patch16_224.dino \
+#   +dataset=inet100 \
 #   +epochs=100 \
-#   +bs=128 \
+#   +bs=256 \
 #   +lr=5e-4 \
-#   +weight_decay=1e-2 \
+#   +weight_decay=5e-2 \
 #   +lamb=0.05 \
 #   +V_global=2 \
-#   +V_local=6 \
-#   +V_mixed=0 \
+#   +V_local=4 \
+#   +V_neighbor=2 \
 #   +global_img_size=224 \
 #   +local_img_size=96 \
 #   +proj_dim=512 \
-#   +grad_accum=2 \
-#   +num_workers=8 \
-#   +prefetch_factor=2 \
+#   +grad_accum=1 \
+#   +num_workers=5 \
+#   +prefetch_factor=1 \
 #   +device=cuda \
 #   +distributed=False \
 #   +world_size=1 \
 #   +seed=0 \
 #   +log_interval=40 \
-#   +use_swa=False
+#   +use_swa=False \
+#   +phn=True \
+#   +phn_p=$P \
+#   +phn_pos_only=$PHN_POS_ONLY \
+#   +phn_neighbor_indices_path="data/b3/imagenet100_b3_P32B32/ranks/neighbors.npy" \
+#   +phn_neighbor_scores_path="data/b3/imagenet100_b3_P32B32/ranks/neighbor_scores.npy" \
+#   +phn_neighbor_sampling="weighted" \
+#   +torch_compile=false
 
+  # +lp_norm_parameter=1.0 \
+  # +mean_shift_value=0.0 \
+  # +target_distribution=lp_distribution \
