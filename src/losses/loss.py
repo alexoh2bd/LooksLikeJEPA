@@ -8,6 +8,7 @@ INFO_NCE (SimCLR)
 import torch
 # from .base import UnivariateTest
 from torch import distributed as dist
+from typing import Optional, Tuple
 
 
 import torch
@@ -31,6 +32,22 @@ def all_reduce(tensor):
     if not (dist.is_available() and dist.is_initialized()):
         return tensor
     return functional_all_reduce(tensor, op=ReduceOp.SUM) / dist.get_world_size()
+
+    
+def is_dist_avail_and_initialized():
+    return dist.is_available() and dist.is_initialized()
+
+
+def _distributed_elementwise_mean(tensor: torch.Tensor) -> torch.Tensor:
+    """Global mean over all DDP ranks (sum/count), matching a single-GPU full batch."""
+    if not is_dist_avail_and_initialized():
+        return tensor.mean()
+    s = tensor.sum()
+    c = torch.tensor([float(tensor.numel())], device=tensor.device, dtype=s.dtype)
+    dist.all_reduce(s, op=dist.ReduceOp.SUM)
+    dist.all_reduce(c, op=dist.ReduceOp.SUM)
+    return s / c
+
 
 def simclr_loss(global_proj, local_proj, temperature=0.5):
     '''
@@ -72,97 +89,114 @@ def simclr_loss(global_proj, local_proj, temperature=0.5):
     # weight denominator differently
     # pos sim + sigreg + weight denom loss + probe
     losses = -pos_sim + denom.unsqueeze(1).log()  # [N, V_l]
-    
-    return losses.mean()
 
-def is_dist_avail_and_initialized():
-    return dist.is_available() and dist.is_initialized()
+    return _distributed_elementwise_mean(losses)
+
 
 class SIGReg(nn.Module):
-    """Sketched Isotropic Gaussian Regularization via the Epps-Pulley test.
-
-    Parameters
-    ----------
-    M : int
-        Number of random projection directions (|A|). Resampled every forward call.
-    knots : int
-        Quadrature points for the Epps-Pulley integral.
-    upper : float
-        Upper bound of the (half-)integration domain.  The full domain is
-        [-upper, upper]; symmetry of the squared-modulus ECF lets us integrate
-        over [0, upper] and double (absorbed into the weight constant).
-    """
-    def __init__(self, M=1024, knots=17, upper=5.0):
+    def __init__(self, M=1024, knots=17, upper=5.0):  # upper=5.0, integrate [0,5] x2 via symmetry
         super().__init__()
         self.M = M
-        t = torch.linspace(0, upper, knots, dtype=torch.float32)
+        t = torch.linspace(0, upper, knots)
         dt = upper / (knots - 1)
         weights = torch.full((knots,), 2 * dt)
         weights[[0, -1]] = dt
         window = torch.exp(-t.square() / 2.0)
-        
         self.register_buffer("t", t)
         self.register_buffer("phi", window)
-        self.register_buffer("weights", weights * window)
-        
+        # x2 for symmetry: ∫_{-5}^{5} = 2 * ∫_{0}^{5} since integrand is even in t
+        self.register_buffer("weights", weights * window * 2.0)
+
     def forward(self, proj, global_step=0):
-        # Generate random projections A on the fly or from buffer
-        # Paper specifies resampling at every step for 'sketching'
+        # proj: (N_local, D) — local batch on this GPU
         g = torch.Generator(device=proj.device)
-        g.manual_seed(global_step)
-    
-        A = torch.randn(proj.size(-1), self.M, generator = g, device=proj.device)
-        A = A / A.norm(p=2, dim=0) # Normalize slices to unit sphere
-        
-        # Project high-dim embeddings to 1D slices
-        # (N, D) @ (D, M) -> (N, M) -> (N, M, 1) * (knots) -> (N, M, K)
-        x_t = (proj @ A).unsqueeze(-1) * self.t
-        
-        cos_mean = x_t.cos().mean(0)
-        sin_mean = x_t.sin().mean(0)
+        g.manual_seed(global_step)   # same seed = same A across all ranks
+        A = torch.randn(proj.size(-1), self.M, generator=g, device=proj.device)
+        A = A / A.norm(p=2, dim=0)
 
-        # if dist.is_initialized():
-        #     cos_mean = all_reduce(cos_mean)
-        #     sin_mean = all_reduce(sin_mean)
+        x_t = (proj @ A).unsqueeze(-1) * self.t   # (N, M, knots)
 
+        # Compute local ECF means (supports autograd gradient flow)
+        cos_mean = x_t.cos().mean(0)   # (M, knots) — local ECF real part
+        sin_mean = x_t.sin().mean(0)   # (M, knots) — local ECF imaginary part
 
-        # ECF distance calculation
+        # Average across DDP ranks via functional all_reduce (autograd-compatible)
+        # Unlike dist.all_reduce (in-place, breaks gradient graph), this preserves grad_fn
+        cos_mean = all_reduce(cos_mean)  # global mean real part of ECF
+        sin_mean = all_reduce(sin_mean)  # global mean imaginary part of ECF
+
+        N = float(proj.size(0))
+        if dist.is_initialized():
+            N = N * dist.get_world_size()
+
         err = (cos_mean - self.phi).square() + sin_mean.square()
-        # Scale by N (batch size) as per the Epps-Pulley statistic definition
-        statistic = (err @ self.weights) * proj.size(0) 
+        statistic = (err @ self.weights) * N   # scale by global N per Epps-Pulley statistic
         return statistic.mean()
 
-def LeJEPA(all_views_proj, num_global, sigreg_module, lamb=0.05, reg="LeJEPA", target=None, global_step=0):
-    """LeJEPA loss: (1 - λ) × Prediction_Loss + λ × SIGReg_Loss.
 
-    Parameters
-    ----------
-    all_views_proj : Tensor (N, V, D)
-        Projections of all views (global + local).
-    num_global : int
-        Number of leading views that are global (Vg).
-    sigreg_module : SIGReg
-        Epps-Pulley regulariser module.
-    lamb : float
-        Weight λ for SIGReg (prediction weight is 1 - λ).
-    target : Tensor (N, 1, D), optional
-        Pre-computed target embedding (e.g. from an SWA encoder).
-        When *None*, the mean of the global views is used.
-    global_step : int
-        Current global training step. Passed to SIGReg to seed the random
-        projection directions identically across all DDP ranks.
-    """
+def LeJEPA(all_views_proj, num_global, sigreg_module, lamb=0.05,
+           reg="LeJEPA", target=None, global_step=0):
+    # all_views_proj: (N, V, D)
+    N, V, D = all_views_proj.shape
+
+    # Prediction loss
     if target is None:
-        global_views = all_views_proj[:, :num_global, :]
-        target = global_views.mean(dim=1, keepdim=True)
+        target = all_views_proj[:, :num_global, :].mean(dim=1, keepdim=True)  # (N, 1, D)
+
     if reg == "hybrid":
-        sim_loss = simclr_loss(all_views_proj[:, :num_global, :], all_views_proj[:, num_global:, :], temperature=0.5)
+        sim_loss = simclr_loss(all_views_proj[:, :num_global, :],
+                               all_views_proj[:, num_global:, :], temperature=0.5)
     else:
-        sim_loss = (all_views_proj - target).square().mean()
-    reg_loss = sigreg_module(all_views_proj.reshape(-1, all_views_proj.size(-1)), global_step)
-    
+        sim_loss = _distributed_elementwise_mean((all_views_proj - target).square())
+
+    # SIGReg: once per view, over N samples — matches paper Algorithm 2
+    # all_views_proj: (N, V, D) -> iterate over V dimension
+    sigreg_per_view = torch.stack([
+        sigreg_module(all_views_proj[:, v, :], global_step)
+        for v in range(V)
+    ])  # (V,)
+    reg_loss = sigreg_per_view.mean()
+
     total_loss = (1 - lamb) * sim_loss + lamb * reg_loss
     return total_loss, sim_loss, reg_loss
+
+
+def compute_author_lejepa_loss(
+    all_proj: torch.Tensor,
+    n_global: int,
+    sliced_ep: nn.Module,
+    lamb: float,
+    combine: str = "additive",
+    target: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Match author ``LeJEPA._compute_loss`` in ``losses/lejepa.py`` with layout ``(N, V, D)``.
+
+    Author reference (layout ``(V, N, K)``)::
+
+        sigreg_loss = sigreg(all_projected.reshape(-1, all_projected.size(-1)))
+
+    ``SlicedEppsPulley`` is called with a single tensor argument only; random ``A`` and the
+    internal step buffer behave like the author's ``LeJEPA`` module (do not pass Lightning
+    ``global_step`` into ``SlicedEppsPulley``).
+    """
+    if target is None:
+        center = all_proj[:, :n_global, :].mean(dim=1, keepdim=True)
+    else:
+        center = target
+
+    inv_loss = _distributed_elementwise_mean((all_proj - center).square())
+
+    flat = all_proj.reshape(-1, all_proj.size(-1))
+    sigreg_loss = sliced_ep(flat)
+
+    if combine == "additive":
+        total = inv_loss + lamb * sigreg_loss
+    elif combine == "convex":
+        total = (1.0 - lamb) * inv_loss + lamb * sigreg_loss
+    else:
+        raise ValueError(f"combine must be 'additive' or 'convex', got {combine!r}")
+
+    return total, inv_loss, sigreg_loss
 
 
 # weighted hybrid between InfoNCE and MSE + SIGReg
@@ -182,15 +216,20 @@ def weighted_hybrid(global_proj, all_proj, sigreg, w=0.5, lamb=0.05, global_step
     local_proj = all_proj[:, global_proj.shape[1]:, :]  # (N, Vl, D)
     cl_loss = simclr_loss(global_proj, local_proj, temperature=0.5)
 
-    # MSE prediction loss
-    inv_loss = (centers - all_proj).square().mean()
+    # MSE prediction loss (global mean across ranks)
+    inv_loss = _distributed_elementwise_mean((centers - all_proj).square())
 
     # SIGReg over each view
     # sigreg_losses = []
     # for i in range(all_proj.shape[1]):
     #     view_emb = all_proj[:, i, :]
     #     sigreg_losses.append(sigreg(view_emb, global_step).sum())
-    sr_loss = sigreg(all_proj.reshape(-1, all_proj.size(-1)), global_step)
+    flat = all_proj.reshape(-1, all_proj.size(-1))
+    try:
+        sr_loss = sigreg(flat, global_step)
+    except TypeError:
+        # Author ``SlicedEppsPulley``: ``forward(x)`` only (internal step counter).
+        sr_loss = sigreg(flat)
     lejepa_loss = (1 - lamb) * inv_loss + lamb * sr_loss
     total_loss = w * lejepa_loss + (1 - w) * cl_loss
 

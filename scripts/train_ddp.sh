@@ -91,7 +91,7 @@ python --version
 #     - proj_dim=64            (Table 1d best)
 #     - 1024 slices, [-5,5], 17 integration points (your SIGReg defaults)
 # ===========================================================================
-srun uv run src/run_training_loop.py \
+srun uv run python src/run_training_loop.py \
   +reg=LeJEPA \
   +model_name=vit_large_patch14_224 \
   +dataset=imagenet-1k \
@@ -101,8 +101,8 @@ srun uv run src/run_training_loop.py \
   +weight_decay=5e-2 \
   +lamb=0.05 \
   +V_global=2 \
-  +V_local=5 \
-  +V_mixed=1 \
+  +V_local=6\
+  +V_mixed=0 \
   +global_img_size=224 \
   +local_img_size=98 \
   +proj_dim=512 \
@@ -116,7 +116,9 @@ srun uv run src/run_training_loop.py \
   +seed=0 \
   +log_interval=200 \
   +use_swa=False \
-  +torch_compile=true
+  +torch_compile=true \
+  +ckpt_every_n_epochs=2 \
+  +sigreg_impl=author
 
 # ===========================================================================
 # Training — PHN (uncomment to run instead of baseline)
@@ -156,8 +158,9 @@ srun uv run src/run_training_loop.py \
 #   +V_neighbor=1 \
 #   +phn_neighbor_sampling="uniform" \
 #   +phn_pos_only=False \
-#   +phn_neighbor_same_label_only=False
-  # Warmup: 6 self-only locals (auto = V_local+V_neighbor), then 4 self + 2 neighbor.
-  # Override with +phn_warmup_V_local=6 if needed.
-  # phn_neighbor_same_label_only: neighbor pool = top-phn_p teacher ranks ∩ same class as anchor.
-  #   +phn_neighbor_start_epoch=20 \
+#   +phn_neighbor_same_label_only=False \
+#   +ckpt_every_n_epochs=2
+#   # Warmup: 6 self-only locals (auto = V_local+V_neighbor), then 4 self + 2 neighbor.
+#   # Override with +phn_warmup_V_local=6 if needed.
+#   # phn_neighbor_same_label_only: neighbor pool = top-phn_p teacher ranks ∩ same class as anchor.
+#   #   +phn_neighbor_start_epoch=20 \

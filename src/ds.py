@@ -55,26 +55,44 @@ def collate_views(batch):
 
 
 class HFDataset(Dataset):
-    def __init__(self, split, V_global=2, V_local=4, device="cuda", global_img_size=224, local_img_size=96, dataset="inet100",seed=0):
+    def __init__(
+        self,
+        split,
+        V_global=2,
+        V_local=4,
+        device="cuda",
+        global_img_size=224,
+        local_img_size=96,
+        dataset="inet100",
+        seed=0,
+        global_rrc_min=0.3,
+        global_rrc_max=1.0,
+        local_rrc_min=0.05,
+        local_rrc_max=0.3,
+    ):
         self.V_global = V_global
         self.V_local = V_local
         self.split = split
         self.global_img_size = global_img_size
         self.local_img_size = local_img_size
-        self.seed=seed
+        self.seed = seed
         self._get_ds(dataset)
         
         # 2. Define Transforms
-        # Global Views: 224x224
+        # Global Views: e.g. 224x224, RRC scale (default ViT-style 0.3–1.0; LpJEPA L.3 uses 0.2–1.0)
         self.global_transform = v2.Compose([
-            v2.RandomResizedCrop(self.global_img_size, scale=(0.3, 1.0)),
+            v2.RandomResizedCrop(
+                self.global_img_size, scale=(float(global_rrc_min), float(global_rrc_max))
+            ),
             v2.RandomHorizontalFlip(p=0.5),
             v2.ToImage(),
         ])
         
-        # Local Views: 96x96
+        # Local Views: e.g. 96x96
         self.local_transform = v2.Compose([
-            v2.RandomResizedCrop(self.local_img_size, scale=(0.05, 0.3)),
+            v2.RandomResizedCrop(
+                self.local_img_size, scale=(float(local_rrc_min), float(local_rrc_max))
+            ),
             v2.RandomHorizontalFlip(p=0.5),
             v2.ToImage(),
         ])
@@ -152,7 +170,11 @@ class CrossInstanceDataset(HFDataset):
         local_img_size=96,
         part_upload=False,
         dataset="inet100",
-        seed=0
+        seed=0,
+        global_rrc_min=0.3,
+        global_rrc_max=1.0,
+        local_rrc_min=0.05,
+        local_rrc_max=0.3,
     ):
         # Initialize parent (Handles loading DS, transforms, V_global/V_local)
         super().__init__(
@@ -161,7 +183,12 @@ class CrossInstanceDataset(HFDataset):
             V_local=V_local,
             global_img_size=global_img_size,
             local_img_size=local_img_size,
-            dataset=dataset
+            dataset=dataset,
+            seed=seed,
+            global_rrc_min=global_rrc_min,
+            global_rrc_max=global_rrc_max,
+            local_rrc_min=local_rrc_min,
+            local_rrc_max=local_rrc_max,
         )
         self.rng=np.random.default_rng(self.seed)
         self.V_mixed = V_mixed

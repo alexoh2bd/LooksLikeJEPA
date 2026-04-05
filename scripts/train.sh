@@ -70,8 +70,8 @@ srun uv run python src/run_training_loop.py \
   +weight_decay=5e-2 \
   +lamb=0.05 \
   +V_global=2 \
-  +V_local=5 \
-  +V_mixed=1 \
+  +V_local=6 \
+  +V_mixed=0 \
   +global_img_size=224 \
   +local_img_size=96 \
   +proj_dim=512 \

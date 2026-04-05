@@ -3,13 +3,15 @@ Unified Training Pipeline for JEPA and Contrastive Learning.
 
 Supports gradient accumulation and is designed to be extended for DDP.
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision.transforms import v2
 from torch.amp import autocast
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, LambdaLR
+from timm.optim.lars import Lars
 from torch.optim.swa_utils import AveragedModel
 from abc import abstractmethod
 from typing import Dict, Any, Optional, List, Tuple
@@ -20,7 +22,13 @@ import os
 import numpy as np
 import tqdm
 import wandb
-from losses.loss import simclr_loss, LeJEPA, SIGReg, weighted_hybrid
+from losses.loss import (
+    simclr_loss,
+    LeJEPA,
+    SIGReg,
+    weighted_hybrid,
+    compute_author_lejepa_loss,
+)
 from losses.lploss import rectified_lp_jepa_loss, rdmreg_loss, choose_sigma_for_unit_var
 import torch.distributed as dist 
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -31,7 +39,6 @@ from ds import HFDataset, CrossInstanceDataset, collate_views
 from neighbor_index import NeighborIndex
 from mixed_view_ds import NeighborViewDataset, collate_mixed_views
 from pipeline.batch_sampler import PosBatchSampler
-from losses.misc import gather
 
 logging.basicConfig(level=logging.INFO)
 
@@ -72,7 +79,14 @@ class TrainerConfig:
     bs: int = 256
     epochs: int = 100
     lr: float = 5e-4
-    weight_decay: float = 1e-2           
+    weight_decay: float = 1e-2
+    # "adamw" | "lars" — LARS (You et al., 2017) for LpJEPA-style ImageNet-100 runs
+    optimizer: str = "adamw"
+    # Linear probe / classifier LR (AdamW default 3e-3; LpJEPA: 0.0275 with LARS @ bs=128)
+    lr_probe: float = 3e-3
+    momentum: float = 0.9
+    # Final LR multiplier vs peak after cosine (matches legacy eta_min = lr / 1000)
+    cosine_eta_min_ratio: float = 0.001
     grad_accum: int = 1
     max_grad_norm: float = 3.0
     seed: int = 0
@@ -112,16 +126,37 @@ class TrainerConfig:
     distributed: bool = False
     world_size: int = 1
 
+    # Augmentation (da Costa / LpJEPA L.3: RRC global (0.2,1.0), solarize p=0.1)
+    global_rrc_min: float = 0.3
+    global_rrc_max: float = 1.0
+    local_rrc_min: float = 0.05
+    local_rrc_max: float = 0.3
+    solarize_p: float = 0.2
+
+    # LeJEPA / SIGReg: "legacy" = per-view SIGReg in losses.loss; "author" = SlicedEppsPulley + flattened pass
+    sigreg_impl: str = "author"
+    # "convex" = (1-λ)*inv + λ*sigreg (legacy); "additive" = inv + λ*sigreg (paper-style)
+    lejepa_combine: str = "convex"
+    sigreg_n_slices: int = 1024
+    sigreg_t_max: float = 3.0
+    sigreg_n_points: int = 17
+
     @classmethod
     def from_hydra(cls, cfg) -> "TrainerConfig":
         """Create config from Hydra DictConfig."""
+        mn = str(cfg.get("model_name", "vit_large_patch16_224")).lower()
+        default_wd = 5e-2 if mn.startswith("vit") else 5e-4
         return cls(
             model_name=cfg.get("model_name", "vit_large_patch16_224"),
             proj_dim=cfg.get("proj_dim", 512),
             bs=cfg.get("bs", 256),
             epochs=cfg.get("epochs", 100),
             lr=cfg.get("lr", 5e-4),
-            weight_decay=cfg.get("weight_decay", 1e-2),
+            weight_decay=cfg.get("weight_decay", default_wd),
+            optimizer=str(cfg.get("optimizer", "adamw")).lower(),
+            lr_probe=cfg.get("lr_probe", 3e-3),
+            momentum=cfg.get("momentum", 0.9),
+            cosine_eta_min_ratio=cfg.get("cosine_eta_min_ratio", 0.001),
             grad_accum=cfg.get("grad_accum", 1),
             max_grad_norm=cfg.get("max_grad_norm", 3.0),
             dataset=cfg.get("dataset", "imagenet-1k"),
@@ -142,6 +177,16 @@ class TrainerConfig:
             use_swa=cfg.get("use_swa", False),
             reproducible=cfg.get("reproducible", False),
             torch_compile=cfg.get("torch_compile", True),
+            global_rrc_min=cfg.get("global_rrc_min", 0.3),
+            global_rrc_max=cfg.get("global_rrc_max", 1.0),
+            local_rrc_min=cfg.get("local_rrc_min", 0.05),
+            local_rrc_max=cfg.get("local_rrc_max", 0.3),
+            solarize_p=cfg.get("solarize_p", 0.2),
+            sigreg_impl=str(cfg.get("sigreg_impl", "author")).lower(),
+            lejepa_combine=str(cfg.get("lejepa_combine", "convex")).lower(),
+            sigreg_n_slices=cfg.get("sigreg_n_slices", 1024),
+            sigreg_t_max=cfg.get("sigreg_t_max", 3.0),
+            sigreg_n_points=cfg.get("sigreg_n_points", 17),
         )
 
 
@@ -294,6 +339,10 @@ class BaseTrainer(L.LightningModule):
                 neighbor_same_label_only=getattr(
                     cfg, "phn_neighbor_same_label_only", False
                 ),
+                global_rrc_min=cfg.global_rrc_min,
+                global_rrc_max=cfg.global_rrc_max,
+                local_rrc_min=cfg.local_rrc_min,
+                local_rrc_max=cfg.local_rrc_max,
             )
             self._phn_dataset = self.train_ds
             # Cross-check: do image 0's neighbors have the same label?
@@ -319,6 +368,10 @@ class BaseTrainer(L.LightningModule):
                 global_img_size=cfg.global_img_size,
                 dataset=cfg.dataset,
                 seed=cfg.seed,
+                global_rrc_min=cfg.global_rrc_min,
+                global_rrc_max=cfg.global_rrc_max,
+                local_rrc_min=cfg.local_rrc_min,
+                local_rrc_max=cfg.local_rrc_max,
             )
         else:
             self.train_ds = HFDataset(
@@ -329,6 +382,10 @@ class BaseTrainer(L.LightningModule):
                 global_img_size=cfg.global_img_size,
                 dataset=cfg.dataset,
                 seed=cfg.seed,
+                global_rrc_min=cfg.global_rrc_min,
+                global_rrc_max=cfg.global_rrc_max,
+                local_rrc_min=cfg.local_rrc_min,
+                local_rrc_max=cfg.local_rrc_max,
             )
 
         self.test_ds = HFDataset(
@@ -339,6 +396,10 @@ class BaseTrainer(L.LightningModule):
             global_img_size=cfg.global_img_size,
             dataset=cfg.dataset,
             seed=cfg.seed,
+            global_rrc_min=cfg.global_rrc_min,
+            global_rrc_max=cfg.global_rrc_max,
+            local_rrc_min=cfg.local_rrc_min,
+            local_rrc_max=cfg.local_rrc_max,
         )
     
     def _build_probe(self) -> nn.Module:
@@ -466,6 +527,10 @@ class BaseTrainer(L.LightningModule):
         return DataLoader(self.test_ds, **kw)
 
     def on_train_epoch_start(self):
+        if self.logger and hasattr(self.logger, 'experiment'):
+            self.logger.experiment.define_metric("*", step_metric="trainer/global_step")
+            # Offset all future logs by the checkpoint's global step
+        self._wandb_step_offset = self.global_step
         """Advance per-epoch seeds for PHN neighbor sampling and PosBatchSampler."""
         if self._phn_sampler is not None:
             self._phn_sampler.set_epoch(self.current_epoch)
@@ -496,79 +561,134 @@ class BaseTrainer(L.LightningModule):
     
     def _build_gpu_aug_global(self) -> v2.Compose:
         """Build GPU augmentation pipeline for global views."""
+        sp = float(self.config.solarize_p)
         return v2.Compose([
             v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
             v2.RandomGrayscale(p=0.2),
             v2.RandomApply([v2.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5),
-            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
+            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=sp),
             v2.ToDtype(torch.bfloat16, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     
     def _build_gpu_aug_local(self) -> v2.Compose:
         """Build GPU augmentation pipeline for local views."""
+        sp = float(self.config.solarize_p)
         return v2.Compose([
             v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
             v2.RandomGrayscale(p=0.2),
             v2.RandomApply([v2.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5),
-            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
+            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=sp),
 
             v2.ToDtype(torch.bfloat16, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     
-    def configure_optimizers(self):
-        """AdamW with linear warm-up + cosine annealing on LR only.
+    def _build_warmup_cosine_lambda_scheduler(self, optimizer: torch.optim.Optimizer) -> LambdaLR:
+        """10-epoch linear warmup (0.01→1.0 scale) then cosine to ``cosine_eta_min_ratio``.
 
-        Weight decay is held constant (no schedule) per paper Section 6.1.
-        5e-2 for ViT, 5e-4 for ResNet/ConvNeXt. Final LR = lr/1000.
+        One shared multiplier for all param groups so encoder vs probe LR ratio is fixed.
         """
-        model_name = self.config.model_name.lower()
-        wd = 5e-2 if model_name.startswith("vit") else 5e-4
-        optimizer = torch.optim.AdamW([
-            {
-                'params': self.encoder.parameters(),
-                'lr': self.config.lr,
-                'weight_decay': wd,
-                'betas': (0.9, 0.999),
-            },
-            {
-                'params': self.probe.parameters(),
-                'lr': 3e-3,
-                'weight_decay': 0.0,
-                'betas': (0.9, 0.999),
-            }
-        ])
-        
+        cfg = self.config
         steps_per_epoch = (
-            len(self.train_ds) // self.config.bs // self.config.grad_accum
+            len(self.train_ds) // cfg.bs // cfg.grad_accum
         )
-        warmup_steps = steps_per_epoch * 10  # 10 epoch warmup
-        total_steps = steps_per_epoch * self.trainer.max_epochs
-        
-        warmup_scheduler = LinearLR(
-            optimizer, 
-            start_factor=0.01, 
-            total_iters=warmup_steps
+        warmup_steps = steps_per_epoch * 10
+        max_epochs = (
+            self.trainer.max_epochs if self.trainer is not None else cfg.epochs
         )
-        eta_min = self.config.lr / 1000
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer, 
-            T_max=total_steps - warmup_steps, 
-            eta_min=eta_min
-        )
-        scheduler = SequentialLR(
-            optimizer, 
-            schedulers=[warmup_scheduler, cosine_scheduler], 
-            milestones=[warmup_steps]
-        )
-        
+        total_steps = steps_per_epoch * max_epochs
+        eta_min_ratio = float(cfg.cosine_eta_min_ratio)
+
+        def lr_lambda(step: int) -> float:
+            step = int(step)
+            if step < warmup_steps:
+                return 0.01 + (step / max(1, warmup_steps)) * (1.0 - 0.01)
+            t = step - warmup_steps
+            T = max(1, total_steps - warmup_steps)
+            p = min(1.0, t / T)
+            cosine = 0.5 * (1 + math.cos(math.pi * p))
+            return eta_min_ratio + (1.0 - eta_min_ratio) * cosine
+
+        n = len(optimizer.param_groups)
+        return LambdaLR(optimizer, lr_lambda=[lr_lambda] * n)
+
+    def configure_optimizers(self):
+        """AdamW or LARS with 10-epoch warmup + cosine decay (step-based).
+
+        AdamW: ``SequentialLR`` (LinearLR + CosineAnnealingLR) — legacy behavior.
+        LARS (LpJEPA / You et al., 2017): ``timm.optim.lars.Lars`` + shared
+        ``LambdaLR`` schedule; encoder ``lr``, probe ``lr_probe``, ``momentum``,
+        ``weight_decay`` on encoder only unless overridden.
+
+        Weight decay for AdamW: ``TrainerConfig.weight_decay``; defaults in
+        ``from_hydra`` are 5e-2 for ViT and 5e-4 for non-ViT when unset.
+        """
+        cfg = self.config
+        wd = cfg.weight_decay
+        lr_p = cfg.lr_probe
+
+        if cfg.optimizer.lower() == "lars":
+            optimizer = Lars(
+                [
+                    {"params": self.encoder.parameters(), "lr": cfg.lr, "weight_decay": wd},
+                    {"params": self.probe.parameters(), "lr": lr_p, "weight_decay": 0.0},
+                ],
+                lr=cfg.lr,
+                momentum=float(cfg.momentum),
+                weight_decay=0.0,
+            )
+            scheduler = self._build_warmup_cosine_lambda_scheduler(optimizer)
+        else:
+            optimizer = torch.optim.AdamW(
+                [
+                    {
+                        "params": self.encoder.parameters(),
+                        "lr": cfg.lr,
+                        "weight_decay": wd,
+                        "betas": (0.9, 0.999),
+                    },
+                    {
+                        "params": self.probe.parameters(),
+                        "lr": lr_p,
+                        "weight_decay": 0.0,
+                        "betas": (0.9, 0.999),
+                    },
+                ]
+            )
+
+            steps_per_epoch = (
+                len(self.train_ds) // cfg.bs // cfg.grad_accum
+            )
+            warmup_steps = steps_per_epoch * 10
+            max_epochs = (
+                self.trainer.max_epochs if self.trainer is not None else cfg.epochs
+            )
+            total_steps = steps_per_epoch * max_epochs
+
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.01,
+                total_iters=warmup_steps,
+            )
+            eta_min = cfg.lr / 1000
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps - warmup_steps,
+                eta_min=eta_min,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_steps],
+            )
+
         return {
-            'optimizer': optimizer, 
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'interval': 'step',
-            }
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
         }
     
     def training_step(self, batch, batch_idx):
@@ -576,9 +696,15 @@ class BaseTrainer(L.LightningModule):
         vs, y = batch
         cfg = self.config
 
-        # Separate views by resolution
-        global_views = [vs[i] for i in range(len(vs)) if vs[i].shape[-1] == cfg.global_img_size]
-        local_views = [vs[i] for i in range(len(vs)) if vs[i].shape[-1] == cfg.local_img_size]
+        # Collate order: globals first (all global_img_size), then locals (mixed + local).
+        # Index split avoids duplicating views when global_img_size == local_img_size and V_local=0.
+        vg = cfg.V_global
+        if len(vs) < vg:
+            raise ValueError(
+                f"Expected at least {vg} global view tensors, got {len(vs)}"
+            )
+        global_views = vs[:vg]
+        local_views = vs[vg:]
         
         # Apply GPU augmentations
         global_views = [self.gpu_aug_global(g) for g in global_views]
@@ -619,6 +745,17 @@ class BaseTrainer(L.LightningModule):
         if self.use_swa:
             self.swa_encoder.update_parameters(self.encoder)
     
+    def on_before_optimizer_step(self, optimizer):
+        """Log the pre-clip gradient norm at each step."""
+        norms = [
+            p.grad.norm().item()
+            for g in optimizer.param_groups
+            for p in g["params"]
+            if p.grad is not None
+        ]
+        if norms:
+            self.log("train/grad_norm", max(norms), on_step=True, on_epoch=False)
+
     def on_save_checkpoint(self, checkpoint):
         """Lightning hook for saving additional state."""
         checkpoint['best_acc'] = self.best_acc
@@ -645,7 +782,23 @@ class JEPATrainer(BaseTrainer):
         hydra_cfg: Optional[Any] = None,
     ):
         super().__init__(encoder, config, hydra_cfg)
-        self.sigreg = SIGReg()
+        _sig = getattr(config, "sigreg_impl", "legacy")
+        if _sig == "author" and config.reg == "hybrid":
+            logging.warning(
+                "sigreg_impl=author is not supported for reg=hybrid (per-view SIGReg); "
+                "using legacy SIGReg"
+            )
+            self.sigreg = SIGReg()
+        elif _sig == "author":
+            from losses.lejepa import SlicedEppsPulley
+
+            self.sigreg = SlicedEppsPulley(
+                num_slices=config.sigreg_n_slices,
+                t_max=config.sigreg_t_max,
+                n_points=config.sigreg_n_points,
+            )
+        else:
+            self.sigreg = SIGReg()
         self.lamb = lamb
         self.w = w
 
@@ -662,13 +815,13 @@ class JEPATrainer(BaseTrainer):
         # Forward through encoder
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
-        
-        if self.config.distributed:
-            gathered_proj = self.all_gather(all_proj, sync_grads=True)
-            gathered_emb = self.all_gather(all_emb, sync_grads=True)
-            all_proj = gathered_proj.flatten(0, 1)
-            all_emb = gathered_emb.flatten(0, 1)
-            labels = self.all_gather(labels, sync_grads=False).flatten(0, 1)
+
+        with torch.no_grad():
+            proj_flat = all_proj.detach().flatten(0, 1)
+            self.log("train/proj_norm_mean", proj_flat.norm(dim=-1).mean(),
+                     on_step=True, on_epoch=False, sync_dist=True)
+            self.log("train/proj_std", proj_flat.std(dim=0).mean(),
+                     on_step=True, on_epoch=False, sync_dist=True)
 
         global_proj = all_proj[:, :self.config.V_global, :]
 
@@ -681,9 +834,27 @@ class JEPATrainer(BaseTrainer):
 
         if self.config.reg == "weighted_hybrid":
             ssl_loss, lejepa_loss, cl_loss, sigreg_loss = weighted_hybrid(
-                global_proj, all_proj, self.sigreg, w=self.w, lamb=self.lamb
+                global_proj,
+                all_proj,
+                self.sigreg,
+                w=self.w,
+                lamb=self.lamb,
+                global_step=self.global_step,
             )
             pred_loss = lejepa_loss
+        elif (
+            getattr(self.config, "sigreg_impl", "author") == "author"
+            and self.config.reg == "LeJEPA"
+        ):
+            ssl_loss, pred_loss, sigreg_loss = compute_author_lejepa_loss(
+                all_proj,
+                self.config.V_global,
+                self.sigreg,
+                self.lamb,
+                combine=self.config.lejepa_combine,
+                target=swa_target,
+            )
+            cl_loss = torch.tensor(0.0, device=all_proj.device)
         else:
             ssl_loss, pred_loss, sigreg_loss = LeJEPA(
                 all_proj, self.config.V_global, self.sigreg, self.lamb, reg=self.config.reg,
@@ -775,15 +946,6 @@ class LpJEPATrainer(BaseTrainer):
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
 
-        # DDP gather: standard LpJEPA gathers only all_emb/labels (for probe);
-        # RDMReg gather happens inside rectified_lp_jepa_loss via misc.gather.
-        # lp_hybrid needs full batch for SimCLR, so we gather all_proj too.
-        if self.config.distributed:
-            gathered_emb = self.all_gather(all_emb, sync_grads=True)
-            all_emb = gathered_emb.flatten(0, 1)
-            labels = self.all_gather(labels, sync_grads=False).flatten(0, 1)
-            all_proj = gather(all_proj)  # flatten only if (N,V,D) -> need (N*V, D) for downstream
-
         global_proj = all_proj[:, :self.config.V_global, :]
         local_proj = all_proj[:, self.config.V_global:, :]
 
@@ -841,17 +1003,7 @@ class SimCLRTrainer(BaseTrainer):
 
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
-        
-        # Gather across GPUs if using DDP (Lightning auto-detects)
-        if self.config.distributed:
-            gathered_proj = self.all_gather(all_proj, sync_grads=True)
-            gathered_labels = self.all_gather(labels, sync_grads=False)
-            gathered_emb = self.all_gather(all_emb, sync_grads=True) 
-            
-            all_proj = gathered_proj.flatten(0, 1)
-            all_emb = gathered_emb.flatten(0, 1)  
-            labels = gathered_labels.flatten(0, 1)
-            
+
         global_proj = all_proj[:, :self.config.V_global, :]
         local_proj = all_proj[:, self.config.V_global:, :]
         

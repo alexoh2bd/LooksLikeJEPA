@@ -10,9 +10,25 @@ Usage (LeJEPA – Table 2 replication):
         +lr=5e-4 +weight_decay=1e-2 \\
         +V_global=2 +V_local=6 +V_mixed=0 \\
         +lamb=0.05 +use_swa=False
+
+Author-style SIGReg (``SlicedEppsPulley`` from ``losses/lejepa.py``, same wiring as the
+author ``LeJEPA`` module)::
+
+    +sigreg_impl=author \\
+    +lejepa_combine=additive \\
+    +sigreg_n_slices=1024 +sigreg_t_max=3.0 +sigreg_n_points=17
+
+``compute_author_lejepa_loss`` lives in ``losses/loss.py``; it calls
+``sliced_ep(all_views.flatten(0,1))`` once per step like the reference ``_compute_loss``.
 """
 import os
 import torch
+from torch import _dynamo
+
+# torch.compile + DDP: Dynamo's DDPOptimizer rejects some graphs (PyTorch #104674).
+# Must set at import time — Lightning DDP worker processes do not re-run main().
+_dynamo.config.optimize_ddp = False
+
 import logging
 import hydra
 from omegaconf import DictConfig
@@ -55,7 +71,7 @@ def main(cfg: DictConfig):
     # Build config from hydra
     config = TrainerConfig.from_hydra(cfg)
     config.reproducible = reproducible
-    
+
     # Create encoder
     encoder = Encoder(
         model_name=config.model_name,
@@ -115,11 +131,12 @@ def main(cfg: DictConfig):
         f"LV{config.V_local}_MV{config.V_mixed}"
         + (f"_NV{v_neighbor}_QwenP{config.phn_p}" if v_neighbor else "")
         + f"_BS{config.bs * config.grad_accum}_e{config.epochs}"
-        + (f"_ddp8" if config.distributed else "")
+        + (f"_ddp12" if config.distributed else "")
     )
     logging.info(f"save_prefix: {save_prefix}")
     ckpt_dir=f"data/checkpoints/{save_prefix}"
     # Setup callbacks
+    ckpt_every_n = cfg.get("ckpt_every_n_epochs", 2)
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="{epoch}-{val/acc:.3f}",
@@ -127,12 +144,14 @@ def main(cfg: DictConfig):
         mode="max",
         save_top_k=2,
         save_last=True,
-        every_n_epochs=None,
+        every_n_epochs=ckpt_every_n,
     )
     
     lr_monitor = LearningRateMonitor(logging_interval='step')
     
-    # Setup logger
+    # In run_training_loop.py, before constructing WandbLogger
+
+
     wandb_logger = WandbLogger(
         project="VIT_JEPA_Views",
         entity="aho13-duke-university",
@@ -149,11 +168,12 @@ def main(cfg: DictConfig):
     # phn_pos_only uses PosBatchSampler which handles DDP; do not add DistributedSampler
     phn_pos_only = cfg.get("phn_pos_only", True)
     use_dist_sampler = use_ddp and not (cfg.get("phn", False) and phn_pos_only)
+    grad_clip = cfg.get("gradient_clip_val", 1.0)
     trainer = L.Trainer(
         max_epochs=config.epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=ndevices if use_ddp else 1,
-        check_val_every_n_epoch=4,  # validate every 4 epochs
+        check_val_every_n_epoch=ckpt_every_n,
         strategy="ddp" if use_ddp else "auto",
         precision="bf16-mixed",
         accumulate_grad_batches=config.grad_accum,
@@ -165,6 +185,8 @@ def main(cfg: DictConfig):
         num_nodes=num_nodes,
         use_distributed_sampler=use_dist_sampler,
         sync_batchnorm=use_ddp,
+        gradient_clip_val=grad_clip,
+        gradient_clip_algorithm="norm",
     )
     last_ckpt = f"data/checkpoints/{save_prefix}/last.ckpt"
     init_ckpt = cfg.get("init_ckpt", None)

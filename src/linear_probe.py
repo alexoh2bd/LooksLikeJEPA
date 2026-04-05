@@ -42,6 +42,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torchvision.ops import MLP
 from torchvision.transforms import v2
 from tqdm import tqdm
 
@@ -240,6 +241,127 @@ def load_model(
     return backbone, feat_dim
 
 
+def _infer_mlp_dims_from_proj_sd(proj_sd: dict) -> tuple[int, int]:
+    """Return ``(feat_dim, proj_dim)`` from a ``torchvision.ops.MLP`` state dict."""
+    if "0.weight" not in proj_sd:
+        raise ValueError("Projector state dict missing 0.weight")
+    feat_dim = int(proj_sd["0.weight"].shape[1])
+    last_idx = max(
+        int(k.split(".")[0])
+        for k in proj_sd
+        if k.endswith(".weight") and proj_sd[k].ndim == 2
+    )
+    proj_dim = int(proj_sd[f"{last_idx}.weight"].shape[0])
+    return feat_dim, proj_dim
+
+
+def load_backbone_and_proj(
+    checkpoint_path: str,
+    model_name: str = "vit_large_patch14_224.dino",
+    proj_dim_hint: int = 512,
+    device: str = "cuda",
+):
+    """
+    Load frozen backbone and ``encoder.proj`` MLP (same layout as ``Encoder``).
+
+    Returns
+    -------
+    backbone, proj, feat_dim, proj_dim
+        ``proj`` is ``None`` if the checkpoint has no projector weights (e.g. ``backbone_only``).
+    """
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    backbone_sd: dict = {}
+    proj_sd: dict = {}
+
+    if "backbone_only" in state:
+        backbone_sd = _strip_compile_prefix(state["backbone_only"])
+    elif "encoder" in state:
+        enc_sd = _strip_compile_prefix(state["encoder"])
+        backbone_sd = {
+            k.replace("backbone.", "", 1): v
+            for k, v in enc_sd.items()
+            if k.startswith("backbone.")
+        }
+        proj_sd = {
+            k.replace("proj.", "", 1): v
+            for k, v in enc_sd.items()
+            if k.startswith("proj.")
+        }
+    elif "state_dict" in state:
+        full_sd = _strip_compile_prefix(state["state_dict"])
+        backbone_sd = {
+            k.replace("encoder.backbone.", "", 1): v
+            for k, v in full_sd.items()
+            if k.startswith("encoder.backbone.")
+        }
+        proj_sd = {
+            k.replace("encoder.proj.", "", 1): v
+            for k, v in full_sd.items()
+            if k.startswith("encoder.proj.")
+        }
+    else:
+        raise ValueError(
+            f"Unrecognized checkpoint format — top-level keys: {list(state.keys())[:10]}"
+        )
+
+    backbone = timm.create_model(
+        model_name,
+        pretrained=False,
+        num_classes=0,
+        dynamic_img_size=model_name.startswith("vit"),
+    )
+    feat_dim = backbone.num_features
+
+    info_bb = backbone.load_state_dict(backbone_sd, strict=False)
+    if info_bb.missing_keys:
+        logger.warning("Backbone missing keys: %s", info_bb.missing_keys)
+    if info_bb.unexpected_keys:
+        logger.warning("Backbone unexpected keys: %s", info_bb.unexpected_keys)
+
+    backbone.eval()
+    backbone.requires_grad_(False)
+    backbone.to(device)
+
+    proj = None
+    proj_dim_out = proj_dim_hint
+    if proj_sd:
+        sd_feat_dim, proj_dim_out = _infer_mlp_dims_from_proj_sd(proj_sd)
+        if sd_feat_dim != feat_dim:
+            logger.warning(
+                "Projector feat_dim %d != backbone.num_features %d (using checkpoint proj)",
+                sd_feat_dim,
+                feat_dim,
+            )
+        proj = MLP(
+            sd_feat_dim,
+            [2048, 2048, proj_dim_out],
+            norm_layer=nn.BatchNorm1d,
+        )
+        info_p = proj.load_state_dict(proj_sd, strict=False)
+        if info_p.missing_keys:
+            logger.warning("Projector missing keys: %s", info_p.missing_keys)
+        if info_p.unexpected_keys:
+            logger.warning("Projector unexpected keys: %s", info_p.unexpected_keys)
+        proj.eval()
+        proj.requires_grad_(False)
+        proj.to(device)
+        logger.info(
+            "Loaded backbone+proj from %s  (feat_dim=%d, proj_dim=%d)",
+            checkpoint_path,
+            feat_dim,
+            proj_dim_out,
+        )
+    else:
+        logger.info(
+            "Loaded backbone from %s (no encoder.proj in checkpoint; proj_dim hint=%d)",
+            checkpoint_path,
+            proj_dim_hint,
+        )
+
+    return backbone, proj, feat_dim, proj_dim_out
+
+
 # ---------------------------------------------------------------------------
 # 4. Eval-mode image dataset
 # ---------------------------------------------------------------------------
@@ -287,13 +409,81 @@ def _default_imagenet1k_parquet_dir() -> str:
     )
 
 
-def build_imagenet1k_dataset(split: str, data_dir: str | None = None) -> ImageDataset:
-    """Load ImageNet-1K from local parquet shards (same source as pretraining).
+def _require_imagenet_eval_labels(
+    hf_ds,
+    split: str,
+    *,
+    num_classes: int = 1000,
+) -> None:
+    """Fail fast if ``split`` has no rows with labels in ``[0, num_classes)`` (cov / probe)."""
+    if split == "train":
+        return
+    n = min(500, len(hf_ds))
+    ok = 0
+    for i in range(n):
+        lab = hf_ds[i]["label"]
+        if lab is None:
+            continue
+        li = int(lab)
+        if 0 <= li < num_classes:
+            ok += 1
+    if ok < 2:
+        extra = ""
+        if num_classes == 1000:
+            extra = (
+                " Official ILSVRC `test` shards use label=-1 for every image; "
+                "use split='val' for labeled evaluation, or supply custom parquet."
+            )
+        raise ValueError(
+            f"Dataset split={split!r} has fewer than 2 samples with labels in [0, {num_classes}) "
+            f"among the first {n} rows (found {ok}).{extra}"
+        )
+
+
+def build_imagenet1k_dataset(
+    split: str,
+    data_dir: str | None = None,
+    *,
+    source: str = "parquet",
+    hub_download_mode: str | None = None,
+) -> ImageDataset:
+    """Load ImageNet-1K from local parquet (default) or from the Hugging Face Hub.
 
     ``split`` is ``train``, ``val`` (ILSVRC validation, 50k labeled), or ``test``.
-    Official competition test labels are not public; for a standard top-1 number,
-    use ``val``. Use ``test`` only if your parquet includes ``label`` columns.
+
+    **Test split:** standard ILSVRC test parquets and the Hub ``test`` split use
+    ``label=-1`` for all rows (no public labels). Covariance / probe need
+    ``split='val'`` unless you have a custom parquet with real labels.
+
+    Parameters
+    ----------
+    source
+        ``"parquet"`` — local shards under ``data_dir`` / ``IMAGENET1K_PARQUET_DIR``.
+        ``"hub"`` — ``load_dataset("ILSVRC/imagenet-1k", ...)`` (refreshes cache if
+        ``hub_download_mode="force_redownload"``).
+    hub_download_mode
+        Passed to ``load_dataset`` when ``source="hub"`` (e.g. ``"force_redownload"``).
     """
+    if split not in ("train", "val", "test"):
+        raise ValueError(f"split must be train, val, or test; got {split!r}")
+    if source not in ("parquet", "hub"):
+        raise ValueError(f"source must be 'parquet' or 'hub'; got {source!r}")
+
+    if source == "hub":
+        hf_split = {"train": "train", "val": "validation", "test": "test"}[split]
+        kw: dict = {}
+        if hub_download_mode:
+            kw["download_mode"] = hub_download_mode
+        hf_ds = load_dataset("ILSVRC/imagenet-1k", split=hf_split, **kw)
+        _require_imagenet_eval_labels(hf_ds, split, num_classes=1000)
+        image_key = "image" if "image" in hf_ds.column_names else "img"
+        logger.info(
+            "Loaded ImageNet-1K split=%s (%d samples) from Hub (ILSVRC/imagenet-1k)",
+            split,
+            len(hf_ds),
+        )
+        return ImageDataset(hf_ds, image_key, "label")
+
     root = data_dir or os.environ.get(
         "IMAGENET1K_PARQUET_DIR", _default_imagenet1k_parquet_dir()
     )
@@ -302,17 +492,50 @@ def build_imagenet1k_dataset(split: str, data_dir: str | None = None) -> ImageDa
         "val": "validation*.parquet",
         "test": "test*.parquet",
     }
-    if split not in patterns:
-        raise ValueError(f"split must be train, val, or test; got {split!r}")
     files = sorted(glob.glob(os.path.join(root, patterns[split])))
     if not files:
         raise FileNotFoundError(
             f"No parquet files for split={split!r} under {root} (pattern {patterns[split]})"
         )
     hf_ds = load_dataset("parquet", data_files=files, split="train")
+    _require_imagenet_eval_labels(hf_ds, split, num_classes=1000)
     image_key = "image" if "image" in hf_ds.column_names else "img"
     logger.info(
         "Loaded ImageNet-1K split=%s (%d samples) from %s",
+        split,
+        len(hf_ds),
+        root,
+    )
+    return ImageDataset(hf_ds, image_key, "label")
+
+
+def _default_inet100_parquet_dir() -> str:
+    return os.path.join(
+        os.getcwd(),
+        "data/cache/datasets--clane9--imagenet-100/snapshots/"
+        "0519dc2f402a3a18c6e57f7913db059215eee25b/data",
+    )
+
+
+def build_inet100_dataset(split: str, data_dir: str | None = None) -> ImageDataset:
+    """Load ImageNet-100 from local parquet shards (same layout as ``HFDataset`` / training)."""
+    if split not in ("train", "val"):
+        raise ValueError(f"inet100 split must be train or val; got {split!r}")
+    root = data_dir or os.environ.get(
+        "INET100_PARQUET_DIR", _default_inet100_parquet_dir()
+    )
+    patterns = {"train": "train-*.parquet", "val": "validation*.parquet"}
+    files = sorted(glob.glob(os.path.join(root, patterns[split])))
+    if not files:
+        raise FileNotFoundError(
+            f"No inet100 parquet files for split={split!r} under {root} "
+            f"(pattern {patterns[split]})"
+        )
+    hf_ds = load_dataset("parquet", data_files=files, split="train")
+    _require_imagenet_eval_labels(hf_ds, split, num_classes=100)
+    image_key = "image" if "image" in hf_ds.column_names else "img"
+    logger.info(
+        "Loaded inet100 split=%s (%d samples) from %s",
         split,
         len(hf_ds),
         root,
