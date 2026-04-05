@@ -58,16 +58,16 @@ export NCCL_DEBUG=INFO                     # INFO for first run to verify IB; sw
 # export NCCL_DEBUG=WARN
 
 # ===========================================================================
-# HF dataset cache — node-local /tmp avoids NFS "stale file handle" errors
+# HF dataset cache — node-local scratch avoids NFS "stale file handle" errors
 #
-#   Each node gets its own cache. This is fine because HF datasets are
-#   read-only after the first load. Both nodes will independently load
-#   from the parquet shards on the shared filesystem into their local /tmp.
-#   If you see load imbalance, switch to a shared NFS path instead:
-#     export HF_DATASETS_CACHE=/path/on/shared/nfs/hf_cache
+#   Prefer SLURM_TMPDIR (per-node job scratch) when the scheduler sets it; else /tmp.
+#   Each node has its own directory. Ranks on a node share one cache dir; Python
+#   serializes prep on local rank 0 then barrier (see prepare_hf_dataset_cache in ds.py).
+#   Shared NFS cache (if you must): set HF_DATASETS_CACHE to the NFS path and add
 #     export HF_DATASETS_DISABLE_FILE_LOCKING=1
 # ===========================================================================
-export HF_DATASETS_CACHE=/tmp/hf_datasets_${SLURM_JOB_ID}
+: "${SLURM_TMPDIR:=/tmp}"
+export HF_DATASETS_CACHE="${SLURM_TMPDIR}/hf_datasets_${SLURM_JOB_ID}"
 mkdir -p "$HF_DATASETS_CACHE"
 
 # ===========================================================================
@@ -114,11 +114,11 @@ srun uv run python src/run_training_loop.py \
   +world_size=8 \
   +num_nodes=2 \
   +seed=0 \
-  +log_interval=200 \
+  +log_interval=50 \
   +use_swa=False \
   +torch_compile=true \
   +ckpt_every_n_epochs=2 \
-  +sigreg_impl=author
+  +sigreg_impl=legacy
 
 # ===========================================================================
 # Training — PHN (uncomment to run instead of baseline)

@@ -39,6 +39,7 @@ import warnings
 warnings.filterwarnings("ignore", message="Corrupt EXIF data.*", category=UserWarning)
 from trainer import TrainerConfig, SimCLRTrainer, JEPATrainer, LpJEPATrainer
 from encoder import Encoder
+from losses.lejepa import LeJEPA as AuthorLeJEPA
 
 
 logging.basicConfig(level=logging.INFO)
@@ -73,11 +74,28 @@ def main(cfg: DictConfig):
     config.reproducible = reproducible
 
     # Create encoder
-    encoder = Encoder(
-        model_name=config.model_name,
-        proj_dim=config.proj_dim,
-        torch_compile=config.torch_compile,
+    # Use author's LeJEPA module (backbone + projector + _compute_loss) when reg=LeJEPA
+    # and sigreg_impl=author.  All other methods (SimCLR, LpJEPA, hybrid) keep Encoder.
+    _use_author_lejepa = (
+        cfg.get("reg", "LeJEPA") == "LeJEPA"
+        and str(cfg.get("sigreg_impl", "author")).lower() == "author"
     )
+    if _use_author_lejepa:
+        encoder = AuthorLeJEPA(
+            encoder_name=config.model_name,
+            proj_dim=config.proj_dim,
+            n_slices=config.sigreg_n_slices,
+            t_max=config.sigreg_t_max,
+            n_points=config.sigreg_n_points,
+            lamb=cfg.get("lamb", 0.05),
+            drop_path_rate=0.1,
+        )
+    else:
+        encoder = Encoder(
+            model_name=config.model_name,
+            proj_dim=config.proj_dim,
+            torch_compile=config.torch_compile,
+        )
     if cfg.get("phn", False):
         config.phn_neighbor_indices_path = cfg.get("phn_neighbor_indices_path", "")
         config.phn_neighbor_scores_path  = cfg.get("phn_neighbor_scores_path", "")
@@ -131,7 +149,8 @@ def main(cfg: DictConfig):
         f"LV{config.V_local}_MV{config.V_mixed}"
         + (f"_NV{v_neighbor}_QwenP{config.phn_p}" if v_neighbor else "")
         + f"_BS{config.bs * config.grad_accum}_e{config.epochs}"
-        + (f"_ddp12" if config.distributed else "")
+        + "_1"
+        + (f"_ddp13" if config.distributed else "")
     )
     logging.info(f"save_prefix: {save_prefix}")
     ckpt_dir=f"data/checkpoints/{save_prefix}"

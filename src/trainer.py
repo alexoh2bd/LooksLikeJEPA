@@ -29,13 +29,14 @@ from losses.loss import (
     weighted_hybrid,
     compute_author_lejepa_loss,
 )
+from losses.lejepa import LeJEPA as AuthorLeJEPA
 from losses.lploss import rectified_lp_jepa_loss, rdmreg_loss, choose_sigma_for_unit_var
 import torch.distributed as dist 
 from torch.nn.parallel import DistributedDataParallel as DDP
 import lightning as L
 from stats import RepresentationMetrics
 from save import save_checkpoint
-from ds import HFDataset, CrossInstanceDataset, collate_views
+from ds import HFDataset, CrossInstanceDataset, collate_views, prepare_hf_dataset_cache
 from neighbor_index import NeighborIndex
 from mixed_view_ds import NeighborViewDataset, collate_mixed_views
 from pipeline.batch_sampler import PosBatchSampler
@@ -135,6 +136,8 @@ class TrainerConfig:
 
     # LeJEPA / SIGReg: "legacy" = per-view SIGReg in losses.loss; "author" = SlicedEppsPulley + flattened pass
     sigreg_impl: str = "author"
+    # If True, drop incomplete val batches (faster DDP); default False for metric parity vs single-GPU
+    val_drop_last: bool = False
     # "convex" = (1-λ)*inv + λ*sigreg (legacy); "additive" = inv + λ*sigreg (paper-style)
     lejepa_combine: str = "convex"
     sigreg_n_slices: int = 1024
@@ -187,6 +190,7 @@ class TrainerConfig:
             sigreg_n_slices=cfg.get("sigreg_n_slices", 1024),
             sigreg_t_max=cfg.get("sigreg_t_max", 3.0),
             sigreg_n_points=cfg.get("sigreg_n_points", 17),
+            val_drop_last=cfg.get("val_drop_last", False),
         )
 
 
@@ -217,6 +221,9 @@ class BaseTrainer(L.LightningModule):
         self.encoder = encoder
         self.probe = self._build_probe()
 
+        # Second torch.compile pass: Encoder already compiles backbone + proj in encoder.py;
+        # wrapping the full module here yields a whole-graph compile for training_step / validation.
+        # run_training_loop.py sets torch._dynamo.config.optimize_ddp = False for Dynamo + DDP safety.
         if config.torch_compile:
             self.encoder = torch.compile(self.encoder, mode="default", fullgraph=False)
             self.probe = torch.compile(self.probe, mode="default", fullgraph=False)
@@ -303,6 +310,20 @@ class BaseTrainer(L.LightningModule):
         if stage != "fit":
             return
         cfg = self.config
+        # HF Datasets: populate cache on local rank 0 only, then barrier, so ranks do not
+        # concurrently write the same HF_DATASETS_CACHE (NFS stale handles / lock races).
+        tw = getattr(self.trainer, "world_size", None) if self.trainer is not None else None
+        if tw is not None and int(tw) > 1 and dist.is_initialized():
+            local_rank = int(
+                os.environ.get(
+                    "LOCAL_RANK",
+                    getattr(self.trainer, "local_rank", 0),
+                )
+            )
+            if local_rank == 0:
+                prepare_hf_dataset_cache(cfg.dataset)
+            dist.barrier()
+
         test_split = "test" if cfg.dataset == "cifar10" else "val"
 
         if _is_phn(cfg):
@@ -424,8 +445,23 @@ class BaseTrainer(L.LightningModule):
         
         With DDP, each GPU runs independently with its own dataloader.
         To achieve an effective batch size of `bs`, each GPU should process `bs // world_size`.
+        Uses Lightning's ``trainer.world_size`` when attached (matches PosBatchSampler); falls
+        back to ``config.world_size`` before the trainer exists.
         """
-        world_size = self.config.world_size if self.config.distributed else 1
+        if self.config.distributed:
+            world_size = self.config.world_size
+            if self.trainer is not None:
+                tw = int(self.trainer.world_size)
+                if tw != world_size:
+                    logging.warning(
+                        "trainer.world_size (%d) != config.world_size (%d); using trainer.world_size "
+                        "for per-device batch size",
+                        tw,
+                        world_size,
+                    )
+                world_size = tw
+        else:
+            world_size = 1
         per_device_bs = self.config.bs // world_size
         if per_device_bs == 0:
             raise ValueError(f"Batch size {self.config.bs} is too small for {world_size} GPUs")
@@ -516,7 +552,7 @@ class BaseTrainer(L.LightningModule):
             batch_size=self.per_device_batch_size,
             shuffle=False,
             sampler=sampler,
-            drop_last=cfg.distributed,
+            drop_last=bool(cfg.val_drop_last),
             num_workers=cfg.num_workers,
             pin_memory=True,
             persistent_workers=cfg.num_workers > 0,
@@ -782,23 +818,32 @@ class JEPATrainer(BaseTrainer):
         hydra_cfg: Optional[Any] = None,
     ):
         super().__init__(encoder, config, hydra_cfg)
-        _sig = getattr(config, "sigreg_impl", "legacy")
-        if _sig == "author" and config.reg == "hybrid":
-            logging.warning(
-                "sigreg_impl=author is not supported for reg=hybrid (per-view SIGReg); "
-                "using legacy SIGReg"
-            )
-            self.sigreg = SIGReg()
-        elif _sig == "author":
-            from losses.lejepa import SlicedEppsPulley
-
-            self.sigreg = SlicedEppsPulley(
-                num_slices=config.sigreg_n_slices,
-                t_max=config.sigreg_t_max,
-                n_points=config.sigreg_n_points,
-            )
+        # Store flag using the pre-compilation parameter; self.encoder may be a
+        # CompiledModule after BaseTrainer.__init__ runs torch.compile, which would
+        # break isinstance checks later.
+        self._is_author_lejepa = isinstance(encoder, AuthorLeJEPA)
+        # When the encoder is the author's LeJEPA module it owns sigreg internally;
+        # only create a standalone sigreg for legacy / weighted_hybrid paths.
+        if self._is_author_lejepa:
+            self.sigreg = None  # owned by self.encoder.sigreg
         else:
-            self.sigreg = SIGReg()
+            _sig = getattr(config, "sigreg_impl", "author")
+            if _sig == "author" and config.reg == "hybrid":
+                logging.warning(
+                    "sigreg_impl=author is not supported for reg=hybrid (per-view SIGReg); "
+                    "using legacy SIGReg"
+                )
+                self.sigreg = SIGReg()
+            elif _sig == "author":
+                from losses.lejepa import SlicedEppsPulley
+
+                self.sigreg = SlicedEppsPulley(
+                    num_slices=config.sigreg_n_slices,
+                    t_max=config.sigreg_t_max,
+                    n_points=config.sigreg_n_points,
+                )
+            else:
+                self.sigreg = SIGReg()
         self.lamb = lamb
         self.w = w
 
@@ -811,8 +856,31 @@ class JEPATrainer(BaseTrainer):
         local_views: List[torch.Tensor],
         labels: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-    
-        # Forward through encoder
+
+        # ── Author LeJEPA path ──────────────────────────────────────────────
+        if self._is_author_lejepa:
+            output = self.encoder(global_views=global_views, local_views=local_views)
+            ssl_loss    = output.loss
+            pred_loss   = output.inv_loss
+            sigreg_loss = output.sigreg_loss
+            cl_loss     = torch.tensor(0.0, device=ssl_loss.device)
+            with torch.no_grad():
+                self.log("train/proj_norm_mean", output.embedding.norm(dim=-1).mean(),
+                         on_step=True, on_epoch=False, sync_dist=True)
+            # Probe on global backbone features (output.embedding = g_features.detach())
+            # shape: (N * V_global, feat_dim)
+            y_rep = labels.repeat(self.config.V_global)
+            probe_loss = F.cross_entropy(self.probe(output.embedding), y_rep)
+            total_loss = ssl_loss + probe_loss
+            return {
+                "total_loss": total_loss,
+                "sigreg_loss": sigreg_loss,
+                "prediction_loss": pred_loss,
+                "cl_loss": cl_loss,
+                "probe_loss": probe_loss,
+            }
+
+        # ── Legacy / hybrid paths ───────────────────────────────────────────
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
 
@@ -880,6 +948,20 @@ class JEPATrainer(BaseTrainer):
             "cl_loss": cl_loss,
             "probe_loss": probe_loss,
         }
+
+    def validation_step(self, batch, batch_idx):
+        """Override: for AuthorLeJEPA use backbone directly; otherwise defer to BaseTrainer."""
+        vs, y = batch
+        if self._is_author_lejepa:
+            # eval mode: AuthorLeJEPA.forward(images=) returns backbone embedding directly
+            emb_flat = self.encoder(images=vs[0]).embedding  # (N, feat_dim)
+        else:
+            emb, _ = self.encoder(vs)
+            emb_flat = emb.flatten(0, 1)
+        logits = self.probe(emb_flat)
+        acc = (logits.argmax(1) == y).float().mean()
+        self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        return {"emb": emb_flat, "labels": y}
 
 
 class LpJEPATrainer(BaseTrainer):

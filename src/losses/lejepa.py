@@ -1,62 +1,45 @@
-"""LeJEPA: Latent Embedding Joint-Embedding Predictive Architecture.
+"""LeJEPA encoder adapter for use inside JEPATrainer.
 
-Self-supervised learning via multi-view invariance combined with a
-sliced goodness-of-fit test (SIGReg) that pushes embeddings toward
-an isotropic Gaussian.
+``LeJEPA`` is a thin ``nn.Module`` wrapper around
+``stable_pretraining.methods.lejepa.LeJEPA``.  It borrows the backbone and
+projector that the original initialises (architecture is byte-for-byte
+identical), but:
 
-References:
-    Balestriero & LeCun. "LeJEPA: Provable and Scalable
-    Self-Supervised Learning Without the Heuristics." 2025.
-    https://arxiv.org/abs/2511.08544
+* Inherits ``nn.Module`` (not ``pl.LightningModule``) — safe to nest inside
+  ``JEPATrainer`` without stacking two Lightning modules.
+* Replaces ``sigreg`` with a runtime-DDP-safe ``SlicedEppsPulley`` that
+  checks ``dist.is_initialized()`` at forward-time rather than __init__.
+* Exposes ``feat_dim`` alias required by ``BaseTrainer._build_probe``.
+* Enables gradient checkpointing on the backbone.
 
-Example::
-
-    from stable_pretraining.methods.lejepa import LeJEPA
-
-    model = LeJEPA("vit_small_patch16_224")
-
-    global_images = [torch.randn(4, 3, 224, 224)] * 2
-    all_images = [torch.randn(4, 3, 224, 224)] * 6
-                                                                                        
-    model.train()
-    output = model(global_images, all_images)
-    output.loss.backward()
-
-    model.eval()
-    output = model(images=torch.randn(4, 3, 224, 224))
-    features = output.embedding  # [N, D]
+``EppsPulley`` and ``SlicedEppsPulley`` mirror the originals in
+``stable_pretraining.methods.lejepa`` with the DDP init-time caching fix.
 """
 
-from dataclasses import dataclass
-from transformers.utils import ModelOutput
 from typing import Optional
 
-import timm
 import torch
 import torch.nn as nn
 from torch.distributed.nn import all_reduce
 
-# from stable_pretraining import Module
-# from stable_pretraining.backbone import MLP
+from stable_pretraining.methods.lejepa import (  # type: ignore[import-untyped]
+    LeJEPA as _StableLeJEPA,
+    LeJEPAOutput,
+)
+
+__all__ = ["EppsPulley", "SlicedEppsPulley", "LeJEPAOutput", "LeJEPA"]
 
 
 class EppsPulley(nn.Module):
     """Epps-Pulley goodness-of-fit test for univariate normality.
 
-    Projects data onto a grid of points and computes the Epps-Pulley statistic.
-
-    :param t_max: Integration upper bound.
-    :param n_points: Number of integration points.
+    Checks DDP status at forward-time so it works when instantiated before
+    ``dist.init_process_group()`` is called by Lightning.
     """
 
     def __init__(self, t_max: float = 3.0, n_points: int = 17):
         super().__init__()
         assert n_points % 2 == 1
-
-        self._is_ddp = (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
-        )
-        self.world_size = torch.distributed.get_world_size() if self._is_ddp else 1
 
         t = torch.linspace(0, t_max, n_points)
         dt = t_max / (n_points - 1)
@@ -70,59 +53,41 @@ class EppsPulley(nn.Module):
         self.register_buffer("weights", weights * phi)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """:param x: Samples [N, S] (N samples, S slices).
-
-        :return: Per-slice statistic [S].
-        """
         N = x.size(0)
         x_t = x.unsqueeze(-1) * self.t
         cos_mean = x_t.cos().mean(0)
         sin_mean = x_t.sin().mean(0)
 
-        if self._is_ddp:
+        is_ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+        world_size = torch.distributed.get_world_size() if is_ddp else 1
+
+        if is_ddp:
             all_reduce(cos_mean, op=torch.distributed.ReduceOp.AVG)
             all_reduce(sin_mean, op=torch.distributed.ReduceOp.AVG)
 
         err = (cos_mean - self.phi).square() + sin_mean.square()
-        return (err @ self.weights) * N * self.world_size
+        return (err @ self.weights) * N * world_size
 
 
 class SlicedEppsPulley(nn.Module):
     """Sliced Epps-Pulley goodness-of-fit test for multivariate normality.
 
-    Projects data onto random 1-D directions and averages the univariate
-    Epps-Pulley statistics.  A synchronised step counter seeds the random
-    projections so all DDP ranks sample identical directions.
-
-    :param num_slices: Number of random 1-D projections.
-    :param t_max: EP integration upper bound.
-    :param n_points: EP quadrature nodes.
+    Checks DDP status at forward-time so the broadcast fires correctly under
+    Lightning DDP (instantiated before dist.init_process_group).
     """
 
     def __init__(self, num_slices: int = 1024, t_max: float = 3.0, n_points: int = 17):
         super().__init__()
-        self._is_ddp = (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
-        )
         self.num_slices = num_slices
         self.ep = EppsPulley(t_max=t_max, n_points=n_points)
         self.register_buffer("global_step", torch.zeros((), dtype=torch.long))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """:param x: Embeddings [N, D].
-
-        :return: Scalar mean EP statistic.
-        """
         with torch.no_grad():
             step = self.global_step.clone()
-
-            if self._is_ddp:
-                # All ranks increment global_step in lockstep, so this
-                # broadcast is redundant under normal synchronous training.
-                # It is kept as a safety net against step drift from
-                # uneven batches (e.g. drop_last=False).
+            is_ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+            if is_ddp:
                 torch.distributed.broadcast(step, src=0)
-
             g = torch.Generator(device=x.device).manual_seed(step.item())
             A = torch.randn(x.size(-1), self.num_slices, device=x.device, generator=g)
             A = A / A.norm(p=2, dim=0)
@@ -132,186 +97,93 @@ class SlicedEppsPulley(nn.Module):
         return self.ep(proj).mean()
 
 
-@dataclass
-class LeJEPAOutput(ModelOutput):
-    """Output from LeJEPA forward pass.
+class LeJEPA(nn.Module):
+    """nn.Module adapter wrapping ``stable_pretraining.methods.lejepa.LeJEPA``.
 
-    :ivar loss: Combined invariance + SIGReg loss (0 in eval mode).
-    :ivar embedding: Backbone embeddings [V*N, D] (train) or [N, D] (eval).
-    :ivar inv_loss: Invariance component.
-    :ivar sigreg_loss: Epps-Pulley goodness-of-fit component.
+    The backbone and projector are initialised by the original class so the
+    architecture is identical.  Three differences from the original:
+
+    1. Base class is ``nn.Module`` — safe to nest inside ``JEPATrainer``.
+    2. ``sigreg`` is replaced with a runtime-DDP-safe ``SlicedEppsPulley``.
+    3. ``feat_dim`` alias and gradient checkpointing are added.
     """
 
-    loss: torch.Tensor = None
-    embedding: torch.Tensor = None
-    inv_loss: torch.Tensor = None
-    sigreg_loss: torch.Tensor = None
+    def __init__(
+        self,
+        encoder_name: str = "vit_base_patch16_224",
+        proj_dim: int = 512,
+        projector: Optional[nn.Module] = None,
+        n_slices: int = 1024,
+        t_max: float = 3.0,
+        n_points: int = 17,
+        lamb: float = 0.02,
+        pretrained: bool = False,
+        drop_path_rate: float = 0.1,
+    ):
+        super().__init__()
 
+        # Instantiate the original to reuse its backbone + projector setup
+        _impl = _StableLeJEPA(
+            encoder_name=encoder_name,
+            n_slices=n_slices,
+            t_max=t_max,
+            n_points=n_points,
+            lamb=lamb,
+            pretrained=pretrained,
+            drop_path_rate=drop_path_rate,
+        )
+        self.backbone = _impl.backbone
+        self.projector = _impl.projector if projector is None else projector
+        self.embed_dim = _impl.embed_dim
+        del _impl  # release the Lightning wrapper; backbone/projector now owned by self
 
-# class LeJEPA(Module):
-#     """LeJEPA: multi-view invariance + sliced Epps-Pulley SIGReg.
+        # Runtime-DDP-safe replacement for the stale-init sigreg
+        self.sigreg = SlicedEppsPulley(num_slices=n_slices, t_max=t_max, n_points=n_points)
+        self.lamb = lamb
 
-#     Architecture:
-#         - **Backbone**: timm ViT (CLS-pooled, ``num_classes=0``)
-#         - **Projector**: MLP projection head
-#         - **Loss**: ``invariance + (λ * SIGReg)``
+        self.feat_dim = self.embed_dim  # alias for BaseTrainer._build_probe
+        self.backbone.set_grad_checkpointing(True)
 
-#     Centers are computed from global-view projections only.  The invariance
-#     term penalises the MSE between each view's projection and the center.
-#     The SIGReg term is a sliced goodness-of-fit test that pushes
-#     projected embeddings toward an isotropic Gaussian, averaged over views.
+    # Reuse the original's static loss function without duplicating source
+    _compute_loss = staticmethod(_StableLeJEPA._compute_loss)
 
-#     :param encoder_name: timm model name (e.g., ``"vit_base_patch16_224"``)
-#     :param projector: Optional projection head.  When ``None``, a 3-layer
-#         BN+ReLU MLP (``embed_dim → 2048 → 2048 → 512``) is created.
-#     :param n_slices: Random projection directions for the goodness-of-fit test (default: 1024)
-#     :param t_max: EP integration upper bound (default: 3.0)
-#     :param n_points: EP quadrature nodes (default: 17)
-#     :param lamb: SIGReg weight λ (default: 0.02)
-#     :param pretrained: Load pretrained timm weights
+    def forward(
+        self,
+        global_views: Optional[list] = None,
+        local_views: Optional[list] = None,
+        images: Optional[torch.Tensor] = None,
+    ) -> LeJEPAOutput:
+        if self.training:
+            assert global_views is not None and local_views is not None, (
+                "global_views and local_views must be provided in training mode"
+            )
+            g_features = self.backbone(torch.cat(global_views))
+            l_features = self.backbone(torch.cat(local_views))
 
-#     Example::
+            all_features = torch.cat([g_features, l_features])
+            all_projected = self.projector(all_features)
 
-#         model = LeJEPA("vit_base_patch16_224")
-#         images = torch.randn(4, 3, 224, 224)
+            bs = global_views[0].shape[0]
+            n_views = len(global_views) + len(local_views)
+            all_projected = all_projected.view(n_views, bs, -1)
 
-#         model.train()
-#         output = model(
-#             global_views=[images, images],
-#             all_views=[images, images, images, images],
-#         )
-#         output.loss.backward()
-
-#         model.eval()
-#         output = model(images=images)
-#         features = output.embedding  # [4, 768]
-
-#     Example with Lightning::
-
-#         import lightning as pl
-#         from stable_pretraining.methods.lejepa import LeJEPA
-
-
-#         class LeJEPALightning(pl.LightningModule):
-#             def __init__(self):
-#                 super().__init__()
-#                 self.model = LeJEPA("vit_base_patch16_224")
-
-#             def training_step(self, batch, batch_idx):
-#                 views = [v["image"] for v in batch["views"]]
-#                 output = self.model(global_views=views, all_views=views)
-#                 self.log("loss", output.loss)
-#                 return output.loss
-
-#             def configure_optimizers(self):
-#                 return torch.optim.AdamW(self.parameters(), lr=1e-3)
-#     """
-
-#     def __init__(
-#         self,
-#         encoder_name: str = "vit_base_patch16_224",
-#         projector: Optional[nn.Module] = None,
-#         n_slices: int = 1024,
-#         t_max: float = 3.0,
-#         n_points: int = 17,
-#         lamb: float = 0.02,
-#         pretrained: bool = False,
-#         drop_path_rate: float = 0.1,
-#     ):
-#         super().__init__()
-
-#         self.backbone = timm.create_model(
-#             encoder_name,
-#             pretrained=pretrained,
-#             num_classes=0,
-#             **({"dynamic_img_size": True} if "vit" in encoder_name else {}),
-#             drop_path_rate=drop_path_rate,
-#         )
-
-#         embed_dim = self.backbone.embed_dim
-
-#         if projector is None:
-#             projector = nn.Sequential(
-#                 nn.Linear(embed_dim, 512, bias=True),
-#                 MLP(
-#                     in_channels=512,
-#                     hidden_channels=[2048, 2048, 512],
-#                     norm_layer="batch_norm",
-#                     activation_layer=nn.ReLU,
-#                     inplace=True,
-#                     dropout=0.0,
-#                 ),
-#             )
-
-#         self.projector = projector
-
-#         self.sigreg = SlicedEppsPulley(
-#             num_slices=n_slices, t_max=t_max, n_points=n_points
-#         )
-#         self.lamb = lamb
-#         self.embed_dim = embed_dim
-
-#     @staticmethod
-#     def _compute_loss(
-#         all_projected: torch.Tensor,
-#         n_global: int,
-#         sigreg: SlicedEppsPulley,
-#         lamb: float,
-#     ):
-#         """Compute the LeJEPA loss.
-
-#         :param all_projected: All view projections [V, N, K].
-#         :param n_global: Number of global views.
-#         :param sigreg: SlicedEppsPulley module.
-#         :param lamb: SIGReg weight λ.
-#         :return: Tuple of (total_loss, inv_loss, sigreg_loss).
-#         """
-#         centers = all_projected[:n_global].mean(0)  # [N, K]
-#         inv_loss = (centers.unsqueeze(0) - all_projected).square().mean()
-
-#         sigreg_loss = sigreg(all_projected.reshape(-1, all_projected.size(-1)))
-
-#         loss = inv_loss + lamb * sigreg_loss
-#         return loss, inv_loss, sigreg_loss
-
-#     def forward(
-#         self,
-#         global_views: Optional[list[torch.Tensor]] = None,
-#         local_views: Optional[list[torch.Tensor]] = None,
-#         images: Optional[torch.Tensor] = None,
-#     ) -> LeJEPAOutput:
-#         if self.training:
-#             assert global_views is not None and local_views is not None, (
-#                 "global_views and local_views must be provided in training mode"
-#             )
-
-#             g_features = self.backbone(torch.cat(global_views))
-#             l_features = self.backbone(torch.cat(local_views))
-
-#             all_features = torch.cat([g_features, l_features])
-#             all_projected = self.projector(all_features)
-
-#             bs = global_views[0].shape[0]
-#             n_views = len(global_views) + len(local_views)
-#             all_projected = all_projected.view(n_views, bs, -1)
-
-#             loss, inv_loss, sigreg_loss = self._compute_loss(
-#                 all_projected, len(global_views), self.sigreg, self.lamb
-#             )
-#             embedding = g_features.detach()
-#             return LeJEPAOutput(
-#                 loss=loss,
-#                 embedding=embedding,
-#                 inv_loss=inv_loss,
-#                 sigreg_loss=sigreg_loss,
-#             )
-#         else:
-#             assert images is not None, "images must be provided in eval mode"
-#             embedding = self.backbone(images)
-#             zero = torch.tensor(0.0, device=images.device)
-#             return LeJEPAOutput(
-#                 loss=zero,
-#                 embedding=embedding,
-#                 inv_loss=zero,
-#                 sigreg_loss=zero,
-#             )
+            loss, inv_loss, sigreg_loss = self._compute_loss(
+                all_projected, len(global_views), self.sigreg, self.lamb
+            )
+            embedding = g_features.detach()
+            return LeJEPAOutput(
+                loss=loss,
+                embedding=embedding,
+                inv_loss=inv_loss,
+                sigreg_loss=sigreg_loss,
+            )
+        else:
+            assert images is not None, "images must be provided in eval mode"
+            embedding = self.backbone(images)
+            zero = torch.tensor(0.0, device=images.device)
+            return LeJEPAOutput(
+                loss=zero,
+                embedding=embedding,
+                inv_loss=zero,
+                sigreg_loss=zero,
+            )

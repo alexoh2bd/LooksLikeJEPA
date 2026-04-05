@@ -3,12 +3,12 @@
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=24G
 #SBATCH --time=24:00:00
 #SBATCH --partition=compsci-gpu
-#SBATCH --gres=gpu:rtx_pro_6000:1
+#SBATCH --gres=gpu:a5000:2
 
 
 set -e
@@ -80,9 +80,12 @@ srun uv run python src/run_training_loop.py \
   +prefetch_factor=2 \
   +device=cuda \
   +distributed=False \
-  +world_size=1 \
+  +world_size=2 \
   +seed=0 \
   +log_interval=40 \
+  +sigreg_impl=author \
+  +torch_compile=true
+
   # +V_neighbor=1 \
 
   # +use_swa=False \

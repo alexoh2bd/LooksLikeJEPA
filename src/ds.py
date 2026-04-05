@@ -1,4 +1,4 @@
-
+import logging
 import torch
 # import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -7,6 +7,57 @@ from datasets import load_dataset
 
 import random
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def _load_hf_split(dataset: str, split: str):
+    """Load a single HF split (parquet hub paths or CIFAR-10). Used by HFDataset and cache prep."""
+    if dataset == "cifar10":
+        return load_dataset("cifar10", split=split)
+    if dataset == "inet100":
+        inet_dir = (
+            "/home/users/aho13/jepa_tests/data/cache/datasets--clane9--imagenet-100/"
+            "snapshots/0519dc2f402a3a18c6e57f7913db059215eee25b/data/"
+        )
+        filenames = {
+            "train": inet_dir + "train-*.parquet",
+            "val": inet_dir + "validation*.parquet",
+        }
+        return load_dataset("parquet", data_files=filenames, split=split)
+    if dataset == "imagenet-1k":
+        inet_dir = (
+            "/home/users/aho13/jepa_tests/data/hub/datasets--ILSVRC--imagenet-1k/"
+            "snapshots/49e2ee26f3810fb5a7536bbf732a7b07389a47b5/data"
+        )
+        filenames = {
+            "train": inet_dir + "/train*.parquet",
+            "val": inet_dir + "/validation*.parquet",
+            "test": inet_dir + "/test*.parquet",
+        }
+        return load_dataset("parquet", data_files=filenames, split=split)
+    raise ValueError(f"Dataset {dataset} not supported")
+
+
+def prepare_hf_dataset_cache(dataset: str) -> None:
+    """Populate HF Datasets cache for train + eval splits.
+
+    Call from **local rank 0** on each node, then ``torch.distributed.barrier()`` so other
+    ranks do not run concurrent ``load_dataset`` / cache writes on NFS or shared
+    node-local ``HF_DATASETS_CACHE`` (avoids stale handles and lock contention).
+    """
+    if dataset == "cifar10":
+        splits = ("train", "test")
+    else:
+        splits = ("train", "val")
+    logger.info(
+        "prepare_hf_dataset_cache: loading splits %s for dataset=%s",
+        splits,
+        dataset,
+    )
+    for sp in splits:
+        _ = _load_hf_split(dataset, sp)
+    logger.info("prepare_hf_dataset_cache: done for dataset=%s", dataset)
 
 
 def collate_views(batch):
@@ -106,26 +157,7 @@ class HFDataset(Dataset):
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     def _get_ds(self, dataset):
-        if dataset == "cifar10":
-            self.ds = load_dataset("cifar10", split=self.split)
-        elif dataset == "inet100":
-            self.inet_dir = "/home/users/aho13/jepa_tests/data/cache/datasets--clane9--imagenet-100/snapshots/0519dc2f402a3a18c6e57f7913db059215eee25b/data/"
-            filenames = {
-                "train": self.inet_dir + "train-*.parquet",
-                "val": self.inet_dir + "validation*.parquet",
-            }
-            self.ds = load_dataset("parquet", data_files=filenames, split=self.split)
-        elif dataset=="imagenet-1k":
-            self.inet_dir = "/home/users/aho13/jepa_tests/data/hub/datasets--ILSVRC--imagenet-1k/snapshots/49e2ee26f3810fb5a7536bbf732a7b07389a47b5/data"
-            
-            filenames = {
-                "train": self.inet_dir + "/train*.parquet",
-                "val": self.inet_dir + "/validation*.parquet",
-                "test": self.inet_dir + "/test*.parquet",
-            }
-            self.ds = load_dataset("parquet", data_files=filenames, split=self.split)
-        else:
-            raise ValueError(f"Dataset {dataset} not supported")
+        self.ds = _load_hf_split(dataset, self.split)
 
     def _load_image(self, entry):
         """Helper to handle safe image extraction from row entry."""

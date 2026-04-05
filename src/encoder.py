@@ -39,11 +39,13 @@ class Encoder(nn.Module):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-        if torch_compile:
-            self.backbone = torch.compile(
-                self.backbone,
-                mode="reduce-overhead",
-            )
+        # First torch.compile pass (per submodule). BaseTrainer compiles the full Encoder again
+        # when config.torch_compile — intentional double-compile for whole-module graphs.
+        # if torch_compile:
+        #     self.backbone = torch.compile(
+        #         self.backbone,
+        #         mode="reduce-overhead",
+        #     )
 
         self.feat_dim = self.backbone.num_features
 
@@ -52,8 +54,8 @@ class Encoder(nn.Module):
             hidden_channels=[2048, 2048, proj_dim], 
             norm_layer=nn.BatchNorm1d
         )
-        if torch_compile:
-            self.proj = torch.compile(self.proj, mode="default")
+        # if torch_compile:
+        #     self.proj = torch.compile(self.proj, mode="default")
 
     def forward(self, x_list, unnorm=False):
         """

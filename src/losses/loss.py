@@ -27,6 +27,8 @@ import numpy as np
 from torch.distributed.nn import all_reduce as functional_all_reduce
 from torch.distributed.nn import ReduceOp
 
+from losses.lejepa import SlicedEppsPulley
+
 
 def all_reduce(tensor):
     if not (dist.is_available() and dist.is_initialized()):
@@ -37,16 +39,16 @@ def all_reduce(tensor):
 def is_dist_avail_and_initialized():
     return dist.is_available() and dist.is_initialized()
 
-
-def _distributed_elementwise_mean(tensor: torch.Tensor) -> torch.Tensor:
-    """Global mean over all DDP ranks (sum/count), matching a single-GPU full batch."""
+def _distributed_elementwise_mean(tensor):
     if not is_dist_avail_and_initialized():
         return tensor.mean()
-    s = tensor.sum()
-    c = torch.tensor([float(tensor.numel())], device=tensor.device, dtype=s.dtype)
-    dist.all_reduce(s, op=dist.ReduceOp.SUM)
-    dist.all_reduce(c, op=dist.ReduceOp.SUM)
-    return s / c
+    # functional_all_reduce is autograd-aware (backward distributes sum-grad to all ranks)
+    # divide by global_count for the mean, but do NOT also divide by world_size since
+    # DDP gradient averaging will do that automatically
+    N = tensor.numel()
+    s = functional_all_reduce(tensor.sum().unsqueeze(0), op=ReduceOp.SUM)
+    return s[0] / (N * dist.get_world_size())
+
 
 
 def simclr_loss(global_proj, local_proj, temperature=0.5):
@@ -178,6 +180,12 @@ def compute_author_lejepa_loss(
     ``SlicedEppsPulley`` is called with a single tensor argument only; random ``A`` and the
     internal step buffer behave like the author's ``LeJEPA`` module (do not pass Lightning
     ``global_step`` into ``SlicedEppsPulley``).
+
+    **DDP:** Invariance uses :func:`_distributed_elementwise_mean` (global mean over ranks).
+    SIGReg/Epps-Pulley paths all-reduce slice statistics. Assumes synchronous training steps
+    across ranks and symmetric per-rank batch sizes (prefer ``drop_last=True`` on train).
+    If ranks ever desync on step count, sliced projections could diverge; see
+    ``SlicedEppsPulley`` docstring.
     """
     if target is None:
         center = all_proj[:, :n_global, :].mean(dim=1, keepdim=True)
@@ -225,11 +233,10 @@ def weighted_hybrid(global_proj, all_proj, sigreg, w=0.5, lamb=0.05, global_step
     #     view_emb = all_proj[:, i, :]
     #     sigreg_losses.append(sigreg(view_emb, global_step).sum())
     flat = all_proj.reshape(-1, all_proj.size(-1))
-    try:
-        sr_loss = sigreg(flat, global_step)
-    except TypeError:
-        # Author ``SlicedEppsPulley``: ``forward(x)`` only (internal step counter).
+    if isinstance(sigreg, SlicedEppsPulley):
         sr_loss = sigreg(flat)
+    else:
+        sr_loss = sigreg(flat, global_step)
     lejepa_loss = (1 - lamb) * inv_loss + lamb * sr_loss
     total_loss = w * lejepa_loss + (1 - w) * cl_loss
 
