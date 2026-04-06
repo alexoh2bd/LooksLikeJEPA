@@ -1,0 +1,67 @@
+{
+  "timestamp": "2026-04-06T18:44:32.132923",
+  "python": {
+    "version": "3.12.12 (main, Jan 14 2026, 19:35:58) [Clang 21.1.4 ]",
+    "version_info": {
+      "major": 3,
+      "minor": 12,
+      "micro": 12
+    },
+    "executable": "/home/users/aho13/jepa_tests/.venv/bin/python3",
+    "prefix": "/home/users/aho13/jepa_tests/.venv"
+  },
+  "system": {
+    "platform": "Linux-5.15.0-163-generic-x86_64-with-glibc2.35",
+    "system": "Linux",
+    "release": "5.15.0-163-generic",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "hostname": "compsci-cluster-fitz-49"
+  },
+  "packages": {
+    "pip_freeze": "Error getting pip freeze: Command '['/home/users/aho13/jepa_tests/.venv/bin/python3', '-m', 'pip', 'freeze']' returned non-zero exit status 1.",
+    "key_packages": {},
+    "total_packages": 0
+  },
+  "cuda": {
+    "nvidia_smi_output": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 580.105.08, 97887 MiB\nNVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 580.105.08, 97887 MiB",
+    "driver_version": "580.105.08"
+  },
+  "git": {
+    "commit_hash": "bba00de5abb50c639dfd523b9bfce2b27a7cd9d6",
+    "branch": "stable",
+    "has_uncommitted_changes": true,
+    "uncommitted_changes": "M scripts/train.sh\n M scripts/train_ddp.sh\n M src/losses/loss.py\n M src/run_training_loop.py\n M src/trainer.py\n M stable-pretraining",
+    "remote_url": "git@github.com:alexoh2bd/jepa-view-experiments.git"
+  },
+  "slurm": {
+    "SLURM_JOB_ID": "10977381",
+    "SLURM_JOB_NAME": "ddp_train",
+    "SLURM_JOB_PARTITION": "compsci-gpu",
+    "SLURM_JOB_NODELIST": "compsci-cluster-fitz-49",
+    "SLURM_JOB_NUM_NODES": "1",
+    "SLURM_NTASKS": "2",
+    "SLURM_CPUS_PER_TASK": "8",
+    "SLURM_MEM_PER_NODE": "65536",
+    "SLURM_SUBMIT_DIR": "/home/users/aho13/jepa_tests",
+    "SLURM_CLUSTER_NAME": "compsci_cluster"
+  },
+  "environment_variables": {
+    "CUDA_VISIBLE_DEVICES": "0,1",
+    "LD_LIBRARY_PATH": "/home/users/aho13/jepa_tests/.venv/lib/python3.12/site-packages/cv2/../../lib64:/usr/lib:/usr/ucblib:/usr/local/X/lib:/usr/dt/lib:/usr/local/lib",
+    "MKL_NUM_THREADS": "4",
+    "NCCL_DEBUG": "INFO",
+    "NCCL_IB_DISABLE": "0",
+    "NCCL_IB_GID_INDEX": "3",
+    "NCCL_IB_HCA": "mlx5",
+    "NCCL_NET_GDR_LEVEL": "5",
+    "NCCL_P2P_DISABLE": "0",
+    "NCCL_SOCKET_IFNAME": "^docker0,lo",
+    "NCCL_TIMEOUT": "3600",
+    "OMP_NUM_THREADS": "4",
+    "PATH": "/home/users/aho13/jepa_tests/.venv/bin:/home/users/aho13/jepa_tests/.venv/bin:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/home/users/aho13/.cursor-server/bin/linux-x64/a80ff7dfcaa45d7750f6e30be457261379c29b00/bin/remote-cli:/home/users/aho13/.cursor-server/bin/linux-x64/a80ff7dfcaa45d7750f6e30be457261379c29b00/bin/remote-cli:/home/users/aho13/.local/bin:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/auto/pkg/local/bin:/bin:/usr/bin:/sbin:/usr/sbin:/usr/X11R6/bin:/usr/local/X11R6/bin:/usr/local/bin:/usr/prop/bin:/usr/etc:/usr/local/etc:/usr/hosts:~/bin:~/.local/bin",
+    "CUDA_MODULE_LOADING": "LAZY",
+    "MASTER_ADDR": "compsci-cluster-fitz-49",
+    "MASTER_PORT": "22381"
+  }
+}

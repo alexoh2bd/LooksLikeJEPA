@@ -11,11 +11,10 @@ Usage (LeJEPA – Table 2 replication):
         +V_global=2 +V_local=6 +V_mixed=0 \\
         +lamb=0.05 +use_swa=False
 
-Author-style SIGReg (``SlicedEppsPulley`` from ``losses/lejepa.py``, same wiring as the
-author ``LeJEPA`` module)::
+Author-style SIGReg (``SlicedEppsPulley`` from ``losses/lejepa.py``; loss is always
+``inv_loss + lamb * sigreg_loss`` like stable-pretraining)::
 
     +sigreg_impl=author \\
-    +lejepa_combine=additive \\
     +sigreg_n_slices=1024 +sigreg_t_max=3.0 +sigreg_n_points=17
 
 ``compute_author_lejepa_loss`` lives in ``losses/loss.py``; it calls

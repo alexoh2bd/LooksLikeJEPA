@@ -3,12 +3,12 @@
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=24G
 #SBATCH --time=24:00:00
 #SBATCH --partition=compsci-gpu
-#SBATCH --gres=gpu:a5000:2
+#SBATCH --gres=gpu:a5000:1
 
 
 set -e
@@ -45,7 +45,7 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 #
 # Model:       vit_large_patch16_224   (~304M params)
 # Views:       V=8  (2 global 224×224 + 6 local 96×96)
-# Loss:        (1-λ)·MSE + λ·SIGReg,  λ=0.05
+# Loss:        MSE + λ·SIGReg (additive),  λ=0.02
 # SIGReg:      Epps-Pulley, M=1024, 17 knots, domain [-5,5]
 # Optimizer:   AdamW  (betas 0.9, 0.95)
 # LR:          cross-validate {5e-3, 5e-4};  linear warmup + cosine anneal
@@ -68,7 +68,7 @@ srun uv run python src/run_training_loop.py \
   +bs=256 \
   +lr=5e-4 \
   +weight_decay=5e-2 \
-  +lamb=0.05 \
+  +lamb=0.02 \
   +V_global=2 \
   +V_local=6 \
   +V_mixed=0 \

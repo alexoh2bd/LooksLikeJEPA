@@ -1,0 +1,1 @@
+Error getting pip freeze: Command '['/home/users/aho13/jepa_tests/.venv/bin/python3', '-m', 'pip', 'freeze']' returned non-zero exit status 1.

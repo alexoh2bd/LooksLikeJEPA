@@ -134,12 +134,10 @@ class TrainerConfig:
     local_rrc_max: float = 0.3
     solarize_p: float = 0.2
 
-    # LeJEPA / SIGReg: "legacy" = per-view SIGReg in losses.loss; "author" = SlicedEppsPulley + flattened pass
+    # LeJEPA / SIGReg: "legacy" = SIGReg in losses.loss; "author" = SlicedEppsPulley + flatten
     sigreg_impl: str = "author"
     # If True, drop incomplete val batches (faster DDP); default False for metric parity vs single-GPU
     val_drop_last: bool = False
-    # "convex" = (1-λ)*inv + λ*sigreg (legacy); "additive" = inv + λ*sigreg (paper-style)
-    lejepa_combine: str = "convex"
     sigreg_n_slices: int = 1024
     sigreg_t_max: float = 3.0
     sigreg_n_points: int = 17
@@ -168,6 +166,7 @@ class TrainerConfig:
             V_global=cfg.get("V_global", 2),
             V_local=cfg.get("V_local", 6),
             V_mixed=cfg.get("V_mixed", 0),
+            V_neighbor=cfg.get("V_neighbor", 0)
             global_img_size=cfg.get("global_img_size", 224),
             local_img_size=cfg.get("local_img_size", 98),
             device=cfg.get("device", "cuda"),
@@ -186,7 +185,6 @@ class TrainerConfig:
             local_rrc_max=cfg.get("local_rrc_max", 0.3),
             solarize_p=cfg.get("solarize_p", 0.2),
             sigreg_impl=str(cfg.get("sigreg_impl", "author")).lower(),
-            lejepa_combine=str(cfg.get("lejepa_combine", "convex")).lower(),
             sigreg_n_slices=cfg.get("sigreg_n_slices", 1024),
             sigreg_t_max=cfg.get("sigreg_t_max", 3.0),
             sigreg_n_points=cfg.get("sigreg_n_points", 17),
@@ -347,7 +345,7 @@ class BaseTrainer(L.LightningModule):
                 neighbor_index=neighbor_index,
                 V_global=cfg.V_global,
                 V_self=cfg.V_local,
-                V_neighbor=getattr(cfg, "V_neighbor", 2),
+                V_neighbor=getattr(cfg, "V_neighbor", 0),
                 p=getattr(cfg, "phn_p", 64),
                 min_similarity=getattr(cfg, "phn_min_similarity", 0.0),
                 neighbor_sampling=getattr(cfg, "phn_neighbor_sampling", "uniform"),
@@ -863,7 +861,6 @@ class JEPATrainer(BaseTrainer):
             ssl_loss    = output.loss
             pred_loss   = output.inv_loss
             sigreg_loss = output.sigreg_loss
-            cl_loss     = torch.tensor(0.0, device=ssl_loss.device)
             with torch.no_grad():
                 self.log("train/proj_norm_mean", output.embedding.norm(dim=-1).mean(),
                          on_step=True, on_epoch=False, sync_dist=True)
@@ -876,7 +873,6 @@ class JEPATrainer(BaseTrainer):
                 "total_loss": total_loss,
                 "sigreg_loss": sigreg_loss,
                 "prediction_loss": pred_loss,
-                "cl_loss": cl_loss,
                 "probe_loss": probe_loss,
             }
 
@@ -900,17 +896,7 @@ class JEPATrainer(BaseTrainer):
                 _, swa_proj = self.swa_encoder(global_views)
                 swa_target = swa_proj.mean(dim=1, keepdim=True)  # (N, 1, D)
 
-        if self.config.reg == "weighted_hybrid":
-            ssl_loss, lejepa_loss, cl_loss, sigreg_loss = weighted_hybrid(
-                global_proj,
-                all_proj,
-                self.sigreg,
-                w=self.w,
-                lamb=self.lamb,
-                global_step=self.global_step,
-            )
-            pred_loss = lejepa_loss
-        elif (
+        if (
             getattr(self.config, "sigreg_impl", "author") == "author"
             and self.config.reg == "LeJEPA"
         ):
@@ -919,17 +905,16 @@ class JEPATrainer(BaseTrainer):
                 self.config.V_global,
                 self.sigreg,
                 self.lamb,
-                combine=self.config.lejepa_combine,
                 target=swa_target,
             )
-            cl_loss = torch.tensor(0.0, device=all_proj.device)
+            # cl_loss = torch.tensor(0.0, device=all_proj.device)
         else:
             ssl_loss, pred_loss, sigreg_loss = LeJEPA(
                 all_proj, self.config.V_global, self.sigreg, self.lamb, reg=self.config.reg,
                 target=swa_target,
                 global_step=self.global_step,
             )
-            cl_loss = torch.tensor(0.0, device=all_proj.device)
+            # cl_loss = torch.tensor(0.0, device=all_proj.device)
 
         # Compute probe loss
         if getattr(self.config, "V_neighbor", 0) > 0:
@@ -945,7 +930,7 @@ class JEPATrainer(BaseTrainer):
             "total_loss": total_loss,
             "sigreg_loss": sigreg_loss,
             "prediction_loss": pred_loss,
-            "cl_loss": cl_loss,
+            # "cl_loss": cl_loss,
             "probe_loss": probe_loss,
         }
 

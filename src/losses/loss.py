@@ -139,7 +139,7 @@ class SIGReg(nn.Module):
 def LeJEPA(all_views_proj, num_global, sigreg_module, lamb=0.05,
            reg="LeJEPA", target=None, global_step=0):
     # all_views_proj: (N, V, D)
-    N, V, D = all_views_proj.shape
+    _, _, D = all_views_proj.shape
 
     # Prediction loss
     if target is None:
@@ -151,15 +151,12 @@ def LeJEPA(all_views_proj, num_global, sigreg_module, lamb=0.05,
     else:
         sim_loss = _distributed_elementwise_mean((all_views_proj - target).square())
 
-    # SIGReg: once per view, over N samples — matches paper Algorithm 2
-    # all_views_proj: (N, V, D) -> iterate over V dimension
-    sigreg_per_view = torch.stack([
-        sigreg_module(all_views_proj[:, v, :], global_step)
-        for v in range(V)
-    ])  # (V,)
-    reg_loss = sigreg_per_view.mean()
+    # SIGReg: flatten all views into one batch (same as stable-pretraining ``_compute_loss``).
+    # With ``proj`` of shape ``(N*V, D)``, ``SIGReg`` scales by ``N*V*world_size``.
+    reg_loss = sigreg_module(all_views_proj.reshape(-1, D), global_step)
 
-    total_loss = (1 - lamb) * sim_loss + lamb * reg_loss
+    # Paper / stable-pretraining: total = inv + λ * sigreg (not convex reweighting).
+    total_loss = sim_loss + lamb * reg_loss
     return total_loss, sim_loss, reg_loss
 
 
@@ -168,24 +165,13 @@ def compute_author_lejepa_loss(
     n_global: int,
     sliced_ep: nn.Module,
     lamb: float,
-    combine: str = "additive",
     target: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Match author ``LeJEPA._compute_loss`` in ``losses/lejepa.py`` with layout ``(N, V, D)``.
+    """Match ``LeJEPA._compute_loss`` in ``stable_pretraining/methods/lejepa.py`` (layout ``(N, V, D)``).
 
-    Author reference (layout ``(V, N, K)``)::
-
-        sigreg_loss = sigreg(all_projected.reshape(-1, all_projected.size(-1)))
-
-    ``SlicedEppsPulley`` is called with a single tensor argument only; random ``A`` and the
-    internal step buffer behave like the author's ``LeJEPA`` module (do not pass Lightning
-    ``global_step`` into ``SlicedEppsPulley``).
-
-    **DDP:** Invariance uses :func:`_distributed_elementwise_mean` (global mean over ranks).
-    SIGReg/Epps-Pulley paths all-reduce slice statistics. Assumes synchronous training steps
-    across ranks and symmetric per-rank batch sizes (prefer ``drop_last=True`` on train).
-    If ranks ever desync on step count, sliced projections could diverge; see
-    ``SlicedEppsPulley`` docstring.
+    - Invariance: global mean MSE vs. centers from global views (DDP-aware).
+    - SIGReg: ``sliced_ep(all_proj.reshape(-1, D))`` once per step.
+    - Total: ``inv_loss + lamb * sigreg_loss``.
     """
     if target is None:
         center = all_proj[:, :n_global, :].mean(dim=1, keepdim=True)
@@ -193,17 +179,8 @@ def compute_author_lejepa_loss(
         center = target
 
     inv_loss = _distributed_elementwise_mean((all_proj - center).square())
-
-    flat = all_proj.reshape(-1, all_proj.size(-1))
-    sigreg_loss = sliced_ep(flat)
-
-    if combine == "additive":
-        total = inv_loss + lamb * sigreg_loss
-    elif combine == "convex":
-        total = (1.0 - lamb) * inv_loss + lamb * sigreg_loss
-    else:
-        raise ValueError(f"combine must be 'additive' or 'convex', got {combine!r}")
-
+    sigreg_loss = sliced_ep(all_proj.reshape(-1, all_proj.size(-1)))
+    total = inv_loss + lamb * sigreg_loss
     return total, inv_loss, sigreg_loss
 
 

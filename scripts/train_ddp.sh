@@ -2,13 +2,13 @@
 #SBATCH --job-name=ddp_train
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=4
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=320:00:00
 #SBATCH --partition=compsci-gpu
-#SBATCH --gres=gpu:a5000:4
+#SBATCH --gres=gpu:rtx_pro_6000:2
 
 # ===========================================================================
 # Fail fast
@@ -81,16 +81,7 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 which python
 python --version
 
-# ===========================================================================
-# Training — LeJEPA baseline (no PHN)
-#
-#   Matches LeJEPA repo "GOTO hyperparameters":
-#     - vit_large_patch14_224  (paper uses ViT-L/14)
-#     - weight_decay=5e-2      (repo default for ViTs)
-#     - local_img_size=98      (repo default)
-#     - proj_dim=64            (Table 1d best)
-#     - 1024 slices, [-5,5], 17 integration points (your SIGReg defaults)
-# ===========================================================================
+
 srun uv run python src/run_training_loop.py \
   +reg=LeJEPA \
   +model_name=vit_large_patch14_224 \
@@ -99,7 +90,7 @@ srun uv run python src/run_training_loop.py \
   +bs=512 \
   +lr=5e-4 \
   +weight_decay=5e-2 \
-  +lamb=0.05 \
+  +lamb=0.02 \
   +V_global=2 \
   +V_local=6\
   +V_mixed=0 \
@@ -111,14 +102,53 @@ srun uv run python src/run_training_loop.py \
   +prefetch_factor=2 \
   +device=cuda \
   +distributed=True \
-  +world_size=8 \
-  +num_nodes=2 \
+  +world_size=2\
+  +num_nodes=1\
   +seed=0 \
   +log_interval=50 \
   +use_swa=False \
   +torch_compile=true \
   +ckpt_every_n_epochs=2 \
-  +sigreg_impl=legacy
+  +sigreg_impl=author
+
+# ===========================================================================
+# Training — LeJEPA baseline (no PHN)
+#
+#   Matches LeJEPA repo "GOTO hyperparameters":
+#     - vit_large_patch14_224  (paper uses ViT-L/14)
+#     - weight_decay=5e-2      (repo default for ViTs)
+#     - local_img_size=98      (repo default)
+#     - proj_dim=64            (Table 1d best)
+#     - 1024 slices, [-5,5], 17 integration points (your SIGReg defaults)
+# ===========================================================================
+# srun uv run python src/run_training_loop.py \
+#   +reg=LeJEPA \
+#   +model_name=vit_large_patch14_224 \
+#   +dataset=imagenet-1k \
+#   +epochs=100 \
+#   +bs=512 \
+#   +lr=5e-4 \
+#   +weight_decay=5e-2 \
+#   +lamb=0.05 \
+#   +V_global=2 \
+#   +V_local=6\
+#   +V_mixed=0 \
+#   +global_img_size=224 \
+#   +local_img_size=98 \
+#   +proj_dim=512 \
+#   +grad_accum=1 \
+#   +num_workers=7 \
+#   +prefetch_factor=2 \
+#   +device=cuda \
+#   +distributed=True \
+#   +world_size=2\
+#   +num_nodes=1\
+#   +seed=0 \
+#   +log_interval=50 \
+#   +use_swa=False \
+#   +torch_compile=true \
+#   +ckpt_every_n_epochs=2 \
+#   +sigreg_impl=legacy
 
 # ===========================================================================
 # Training — PHN (uncomment to run instead of baseline)
