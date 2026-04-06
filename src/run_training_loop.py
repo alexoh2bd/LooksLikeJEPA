@@ -13,6 +13,11 @@ Usage (LeJEPA – Table 2 replication):
 """
 import os
 import torch
+from torch import _dynamo
+
+# torch.compile + DDP: Dynamo's DDPOptimizer can reject some graphs (PyTorch #104674).
+_dynamo.config.optimize_ddp = False
+
 import logging
 import hydra
 from omegaconf import DictConfig
@@ -26,6 +31,35 @@ from encoder import Encoder
 
 
 logging.basicConfig(level=logging.INFO)
+
+
+def _paper_gradient_clip(cfg: DictConfig) -> float:
+    return float(cfg.get("gradient_clip_val", cfg.get("max_grad_norm", 1.0)))
+
+
+def _build_wandb_logger(cfg: DictConfig, save_prefix: str) -> WandbLogger:
+    """Lightning WandB logger with optional Hydra overrides."""
+    tags = cfg.get("wandb_tags", None)
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    kwargs = {
+        "project": cfg.get("wandb_project", "VIT_JEPA_Views"),
+        "entity": cfg.get("wandb_entity", "aho13-duke-university"),
+        "name": save_prefix,
+        "config": dict(cfg),
+    }
+    if tags:
+        kwargs["tags"] = tags
+    group = cfg.get("wandb_group", None)
+    if group:
+        kwargs["group"] = group
+    job_type = cfg.get("wandb_job_type", None)
+    if job_type:
+        kwargs["job_type"] = job_type
+    notes = cfg.get("wandb_notes", None)
+    if notes:
+        kwargs["notes"] = notes
+    return WandbLogger(**kwargs)
 
 
 @hydra.main(version_base=None)
@@ -55,13 +89,17 @@ def main(cfg: DictConfig):
     # Build config from hydra
     config = TrainerConfig.from_hydra(cfg)
     config.reproducible = reproducible
-    
-    # Create encoder
-    encoder = Encoder(
-        model_name=config.model_name,
-        proj_dim=config.proj_dim,
-        torch_compile=config.torch_compile,
-    )
+
+    reg = cfg.get("reg", "LeJEPA")
+
+    # Encoder only for non-paper methods (paper uses stable_pretraining.methods.lejepa.LeJEPA)
+    encoder = None
+    if reg != "paper":
+        encoder = Encoder(
+            model_name=config.model_name,
+            proj_dim=config.proj_dim,
+            torch_compile=config.torch_compile,
+        )
     if cfg.get("phn", False):
         config.phn_neighbor_indices_path = cfg.get("phn_neighbor_indices_path", "")
         config.phn_neighbor_scores_path  = cfg.get("phn_neighbor_scores_path", "")
@@ -78,8 +116,11 @@ def main(cfg: DictConfig):
 
 
     # Create model based on method type
-    reg = cfg.get("reg", "LeJEPA")
-    if reg == "SimCLR" or reg=="SupCon":
+    if reg == "paper":
+        from paper import PaperTrainer
+
+        model = PaperTrainer(cfg)
+    elif reg == "SimCLR" or reg == "SupCon":
         model = SimCLRTrainer(
             encoder=encoder,
             config=config,
@@ -114,31 +155,37 @@ def main(cfg: DictConfig):
         f"{model.get_method_name()}_{config.dataset}/"
         f"LV{config.V_local}_MV{config.V_mixed}"
         + (f"_NV{v_neighbor}_QwenP{config.phn_p}" if v_neighbor else "")
-        + f"_BS{config.bs * config.grad_accum}_e{config.epochs}"
-        + (f"_ddp8" if config.distributed else "")
+        + f"_BS{config.bs * config.grad_accum}_e{config.epochs}" +"_1a"
+        + (f"_ddp1" if config.distributed else "")
     )
     logging.info(f"save_prefix: {save_prefix}")
-    ckpt_dir=f"data/checkpoints/{save_prefix}"
+    ckpt_dir = f"data/checkpoints/{save_prefix}"
     # Setup callbacks
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=ckpt_dir,
-        filename="{epoch}-{val/acc:.3f}",
-        monitor="val/acc",
-        mode="max",
-        save_top_k=2,
-        save_last=True,
-        every_n_epochs=None,
-    )
+    if reg == "paper":
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="{epoch}-{val/acc:.3f}",
+            monitor="val/acc",
+            mode="max",
+            save_top_k=2,
+            save_last=True,
+            every_n_epochs=2,
+        )
+    else:
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="{epoch}-{val/acc:.3f}",
+            monitor="val/acc",
+            mode="max",
+            save_top_k=2,
+            save_last=True,
+            every_n_epochs=None,
+        )
     
     lr_monitor = LearningRateMonitor(logging_interval='step')
     
-    # Setup logger
-    wandb_logger = WandbLogger(
-        project="VIT_JEPA_Views",
-        entity="aho13-duke-university",
-        name=save_prefix,
-        config=dict(cfg),
-    )
+    # Setup logger (Hydra: +wandb_project=... +wandb_tags=paper,lejepa +wandb_group=...)
+    wandb_logger = _build_wandb_logger(cfg, save_prefix)
     
     # Create Lightning Trainer
     # Use "auto" for single GPU (avoids DDP overhead), "ddp" for multi-GPU
@@ -149,6 +196,13 @@ def main(cfg: DictConfig):
     # phn_pos_only uses PosBatchSampler which handles DDP; do not add DistributedSampler
     phn_pos_only = cfg.get("phn_pos_only", True)
     use_dist_sampler = use_ddp and not (cfg.get("phn", False) and phn_pos_only)
+    # PaperTrainer attaches its own DistributedSampler; avoid double wrapping
+    if reg == "paper" and use_ddp:
+        use_dist_sampler = False
+
+    grad_clip = (
+        _paper_gradient_clip(cfg) if reg == "paper" else config.max_grad_norm
+    )
     trainer = L.Trainer(
         max_epochs=config.epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -165,6 +219,8 @@ def main(cfg: DictConfig):
         num_nodes=num_nodes,
         use_distributed_sampler=use_dist_sampler,
         sync_batchnorm=use_ddp,
+        gradient_clip_val=grad_clip,
+        gradient_clip_algorithm="norm",
     )
     last_ckpt = f"data/checkpoints/{save_prefix}/last.ckpt"
     init_ckpt = cfg.get("init_ckpt", None)

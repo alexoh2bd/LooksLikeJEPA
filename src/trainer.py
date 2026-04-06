@@ -536,7 +536,7 @@ class BaseTrainer(L.LightningModule):
                 'params': self.probe.parameters(),
                 'lr': 3e-3,
                 'weight_decay': 0.0,
-                'betas': (0.9, 0.999),
+                'betas': (0.9, 0.95),
             }
         ])
         
@@ -595,7 +595,20 @@ class BaseTrainer(L.LightningModule):
         # Lightning's accumulate_grad_batches already handles gradient averaging properly
         # Do NOT divide by grad_accum here - that would double-scale the loss
         return loss_dict["total_loss"]
-    
+
+    def on_before_optimizer_step(self, optimizer, *args, **kwargs) -> None:
+        """Log total gradient L2 norm before Lightning applies gradient_clip_val."""
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            self.parameters(), max_norm=float("inf")
+        )
+        self.log(
+            "train/grad_norm",
+            total_norm,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+        )
+
     def validation_step(self, batch, batch_idx):
         """Lightning hook for validation step."""
         vs, y = batch
@@ -662,13 +675,23 @@ class JEPATrainer(BaseTrainer):
         # Forward through encoder
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
-        
-        if self.config.distributed:
-            gathered_proj = self.all_gather(all_proj, sync_grads=True)
-            gathered_emb = self.all_gather(all_emb, sync_grads=True)
-            all_proj = gathered_proj.flatten(0, 1)
-            all_emb = gathered_emb.flatten(0, 1)
-            labels = self.all_gather(labels, sync_grads=False).flatten(0, 1)
+
+        with torch.no_grad():
+            proj_flat = all_proj.detach().flatten(0, 1)
+            self.log(
+                "train/proj_norm_mean",
+                proj_flat.norm(dim=-1).mean(),
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+            self.log(
+                "train/proj_std",
+                proj_flat.std(dim=0).mean(),
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
 
         global_proj = all_proj[:, :self.config.V_global, :]
 
@@ -679,24 +702,14 @@ class JEPATrainer(BaseTrainer):
                 _, swa_proj = self.swa_encoder(global_views)
                 swa_target = swa_proj.mean(dim=1, keepdim=True)  # (N, 1, D)
 
-        if self.config.reg == "weighted_hybrid":
-            ssl_loss, lejepa_loss, cl_loss, sigreg_loss = weighted_hybrid(
-                global_proj, all_proj, self.sigreg, w=self.w, lamb=self.lamb
-            )
-            pred_loss = lejepa_loss
-        else:
-            ssl_loss, pred_loss, sigreg_loss = LeJEPA(
-                all_proj, self.config.V_global, self.sigreg, self.lamb, reg=self.config.reg,
-                target=swa_target,
-                global_step=self.global_step,
-            )
-            cl_loss = torch.tensor(0.0, device=all_proj.device)
 
-        # Compute probe loss
-        if getattr(self.config, "V_neighbor", 0) > 0:
-            V = len(global_views) + len(local_views)
-        else:
-            V = self.config.V_global + self.config.V_local + self.config.V_mixed
+        ssl_loss, pred_loss, sigreg_loss = LeJEPA(
+            all_proj, self.config.V_global, self.sigreg, self.lamb, reg=self.config.reg,
+            target=swa_target,
+            global_step=self.global_step,
+        )
+
+        V = self.config.V_global + self.config.V_local + self.config.V_mixed + getattr(self.config, "V_neighbor", 0)
         y_rep = labels.repeat_interleave(V)
         yhat = self.probe(all_emb.flatten(0, 1).detach())
         probe_loss = F.cross_entropy(yhat, y_rep)
@@ -706,7 +719,6 @@ class JEPATrainer(BaseTrainer):
             "total_loss": total_loss,
             "sigreg_loss": sigreg_loss,
             "prediction_loss": pred_loss,
-            "cl_loss": cl_loss,
             "probe_loss": probe_loss,
         }
 

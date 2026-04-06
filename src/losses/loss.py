@@ -92,7 +92,7 @@ class SIGReg(nn.Module):
         [-upper, upper]; symmetry of the squared-modulus ECF lets us integrate
         over [0, upper] and double (absorbed into the weight constant).
     """
-    def __init__(self, M=1024, knots=17, upper=5.0):
+    def __init__(self, M=1024, knots=17, upper=3.0):
         super().__init__()
         self.M = M
         t = torch.linspace(0, upper, knots, dtype=torch.float32)
@@ -104,7 +104,7 @@ class SIGReg(nn.Module):
         self.register_buffer("t", t)
         self.register_buffer("phi", window)
         self.register_buffer("weights", weights * window)
-        
+
     def forward(self, proj, global_step=0):
         # Generate random projections A on the fly or from buffer
         # Paper specifies resampling at every step for 'sketching'
@@ -121,15 +121,15 @@ class SIGReg(nn.Module):
         cos_mean = x_t.cos().mean(0)
         sin_mean = x_t.sin().mean(0)
 
-        # if dist.is_initialized():
-        #     cos_mean = all_reduce(cos_mean)
-        #     sin_mean = all_reduce(sin_mean)
+        if dist.is_initialized():
+            cos_mean = all_reduce(cos_mean)
+            sin_mean = all_reduce(sin_mean)
 
 
         # ECF distance calculation
         err = (cos_mean - self.phi).square() + sin_mean.square()
-        # Scale by N (batch size) as per the Epps-Pulley statistic definition
-        statistic = (err @ self.weights) * proj.size(0) 
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        statistic = (err @ self.weights) * proj.size(0) * world_size
         return statistic.mean()
 
 def LeJEPA(all_views_proj, num_global, sigreg_module, lamb=0.05, reg="LeJEPA", target=None, global_step=0):
@@ -159,7 +159,12 @@ def LeJEPA(all_views_proj, num_global, sigreg_module, lamb=0.05, reg="LeJEPA", t
         sim_loss = simclr_loss(all_views_proj[:, :num_global, :], all_views_proj[:, num_global:, :], temperature=0.5)
     else:
         sim_loss = (all_views_proj - target).square().mean()
-    reg_loss = sigreg_module(all_views_proj.reshape(-1, all_views_proj.size(-1)), global_step)
+    # Per-view SIGReg averaged over V views (matches pseudocode:
+    #   mean(SIGReg(emb, global_step) for emb in a_emb))
+    V = all_views_proj.size(1)
+    reg_loss = torch.stack(
+        [sigreg_module(all_views_proj[:, v, :], global_step) for v in range(V)]
+    ).mean()
     
     total_loss = (1 - lamb) * sim_loss + lamb * reg_loss
     return total_loss, sim_loss, reg_loss

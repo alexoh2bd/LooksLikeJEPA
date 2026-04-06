@@ -54,30 +54,102 @@ def collate_views(batch):
     return stacked_views, labels
 
 
+def collate_paper(batch, V_global: int, V_local: int):
+    """Collate for PaperTrainer: dict with global/local view lists + labels.
+
+    Reuses ``collate_views`` stacking, then splits by view count (globals first).
+    """
+    stacked_views, labels = collate_views(batch)
+    global_views = stacked_views[:V_global]
+    local_views = stacked_views[V_global : V_global + V_local]
+    return {
+        "global_views": global_views,
+        "local_views": local_views,
+        "label": labels,
+    }
+
+
+def collate_paper_val(batch):
+    """Validation collate: single global view per sample → ``images`` tensor [B,3,H,W]."""
+    imgs = []
+    labels = []
+    for views, label in batch:
+        imgs.append(views[0])
+        labels.append(label)
+    return {
+        "images": torch.stack(imgs, dim=0),
+        "label": torch.tensor(labels, dtype=torch.long),
+    }
+
+
+def _paper_train_transforms(global_img_size: int, local_img_size: int):
+    """LeJEPA README-style augmentations: same ops for global/local; only crop scale differs."""
+    imnet = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    def _branch(crop_size: int, scale: tuple):
+        return v2.Compose(
+            [
+                v2.RandomResizedCrop(crop_size, scale=scale),
+                v2.RandomHorizontalFlip(p=0.5),
+                v2.ColorJitter(
+                    brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1
+                ),
+                v2.RandomGrayscale(p=0.2),
+                v2.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0)),
+                v2.RandomSolarize(threshold=0.5, p=0.2),
+                v2.ToImage(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(**imnet),
+            ]
+        )
+
+    return _branch(global_img_size, (0.3, 1.0)), _branch(local_img_size, (0.05, 0.3))
+
+
 class HFDataset(Dataset):
-    def __init__(self, split, V_global=2, V_local=4, device="cuda", global_img_size=224, local_img_size=96, dataset="inet100",seed=0):
+    def __init__(
+        self,
+        split,
+        V_global=2,
+        V_local=4,
+        device="cuda",
+        global_img_size=224,
+        local_img_size=96,
+        dataset="inet100",
+        seed=0,
+        paper_augmentations: bool = False,
+    ):
         self.V_global = V_global
         self.V_local = V_local
         self.split = split
         self.global_img_size = global_img_size
         self.local_img_size = local_img_size
-        self.seed=seed
+        self.seed = seed
+        self.paper_augmentations = paper_augmentations
         self._get_ds(dataset)
-        
-        # 2. Define Transforms
-        # Global Views: 224x224
-        self.global_transform = v2.Compose([
-            v2.RandomResizedCrop(self.global_img_size, scale=(0.3, 1.0)),
-            v2.RandomHorizontalFlip(p=0.5),
-            v2.ToImage(),
-        ])
-        
-        # Local Views: 96x96
-        self.local_transform = v2.Compose([
-            v2.RandomResizedCrop(self.local_img_size, scale=(0.05, 0.3)),
-            v2.RandomHorizontalFlip(p=0.5),
-            v2.ToImage(),
-        ])
+
+        if paper_augmentations:
+            self.global_transform, self.local_transform = _paper_train_transforms(
+                global_img_size, local_img_size
+            )
+        else:
+            # Global Views: 224x224
+            self.global_transform = v2.Compose(
+                [
+                    v2.RandomResizedCrop(self.global_img_size, scale=(0.3, 1.0)),
+                    v2.RandomHorizontalFlip(p=0.5),
+                    v2.ToImage(),
+                ]
+            )
+
+            # Local Views: 96x96
+            self.local_transform = v2.Compose(
+                [
+                    v2.RandomResizedCrop(self.local_img_size, scale=(0.05, 0.3)),
+                    v2.RandomHorizontalFlip(p=0.5),
+                    v2.ToImage(),
+                ]
+            )
 
         # Test transform
         self.test_transform = v2.Compose([
