@@ -15,3 +15,4 @@
 *.nsys-rep
 *__pycache__
 *.sh
+/stable-pretraining

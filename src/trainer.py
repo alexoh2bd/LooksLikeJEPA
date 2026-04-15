@@ -3,13 +3,15 @@ Unified Training Pipeline for JEPA and Contrastive Learning.
 
 Supports gradient accumulation and is designed to be extended for DDP.
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision.transforms import v2
 from torch.amp import autocast
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, LambdaLR
+from timm.optim.lars import Lars
 from torch.optim.swa_utils import AveragedModel
 from abc import abstractmethod
 from typing import Dict, Any, Optional, List, Tuple
@@ -20,18 +22,24 @@ import os
 import numpy as np
 import tqdm
 import wandb
-from losses.loss import simclr_loss, LeJEPA, SIGReg, weighted_hybrid
+from losses.loss import (
+    simclr_loss,
+    LeJEPA,
+    SIGReg,
+    weighted_hybrid,
+    compute_author_lejepa_loss,
+)
+from losses.lejepa import LeJEPA as AuthorLeJEPA
 from losses.lploss import rectified_lp_jepa_loss, rdmreg_loss, choose_sigma_for_unit_var
 import torch.distributed as dist 
 from torch.nn.parallel import DistributedDataParallel as DDP
 import lightning as L
 from stats import RepresentationMetrics
 from save import save_checkpoint
-from ds import HFDataset, CrossInstanceDataset, collate_views
+from ds import HFDataset, CrossInstanceDataset, collate_views, prepare_hf_dataset_cache
 from neighbor_index import NeighborIndex
-from mixed_view_ds import MixedViewDataset, collate_mixed_views
+from mixed_view_ds import NeighborViewDataset, collate_mixed_views
 from pipeline.batch_sampler import PosBatchSampler
-from losses.misc import gather
 
 logging.basicConfig(level=logging.INFO)
 
@@ -54,6 +62,26 @@ def _make_worker_init_fn(base_seed: int):
 
     return init_fn
 
+def _make_cross_instance_worker_init_fn(base_seed: int):
+    """Seed worker-level RNGs (torch, numpy legacy, random) per (rank, worker_id).
+
+    CrossInstanceDataset partner selection is now fully deterministic per
+    (item_index, epoch, rank) via np.random.default_rng([i, epoch, rank]) in
+    __getitem__ — no stateful self.rng is used there. This function seeds the
+    remaining worker-level RNG sources (torchvision augmentation transforms, etc.)
+    so that augmentation is also unique per rank × worker.
+    """
+    def init_fn(worker_id: int) -> None:
+        import numpy as np
+        import random
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        # Multiplier 10_000 > max num_workers so seeds never collide across ranks.
+        unique_seed = base_seed + rank * 10_000 + worker_id
+        np.random.seed(unique_seed & 0xFFFF_FFFF)
+        random.seed(unique_seed)
+        torch.manual_seed(unique_seed)
+    return init_fn
+
 
 @dataclass
 class TrainerConfig:
@@ -72,7 +100,14 @@ class TrainerConfig:
     bs: int = 256
     epochs: int = 100
     lr: float = 5e-4
-    weight_decay: float = 1e-2           
+    weight_decay: float = 1e-2
+    # "adamw" | "lars" — LARS (You et al., 2017) for LpJEPA-style ImageNet-100 runs
+    optimizer: str = "adamw"
+    # Linear probe / classifier LR (AdamW default 3e-3; LpJEPA: 0.0275 with LARS @ bs=128)
+    lr_probe: float = 3e-3
+    momentum: float = 0.9
+    # Final LR multiplier vs peak after cosine (matches legacy eta_min = lr / 1000)
+    cosine_eta_min_ratio: float = 0.001
     grad_accum: int = 1
     max_grad_norm: float = 3.0
     seed: int = 0
@@ -87,6 +122,7 @@ class TrainerConfig:
     V_global: int = 2
     V_local: int = 6
     V_mixed: int = 0
+    V_neighbor: int = 0
     global_img_size: int = 224
     local_img_size: int = 98
     
@@ -102,6 +138,9 @@ class TrainerConfig:
 
     # Reproducibility (slower; use for debugging or exact replication)
     reproducible: bool = False
+
+    # torch.compile (encoder + probe); set False to avoid Inductor/Triton issues or nested compile
+    torch_compile: bool = True
     
     # DDP placeholders (to be set by distributed setup)
     rank: int = 0
@@ -109,16 +148,37 @@ class TrainerConfig:
     distributed: bool = False
     world_size: int = 1
 
+    # Augmentation (da Costa / LpJEPA L.3: RRC global (0.2,1.0), solarize p=0.1)
+    global_rrc_min: float = 0.3
+    global_rrc_max: float = 1.0
+    local_rrc_min: float = 0.05
+    local_rrc_max: float = 0.3
+    solarize_p: float = 0.2
+
+    # LeJEPA / SIGReg: "legacy" = SIGReg in losses.loss; "author" = SlicedEppsPulley + flatten
+    sigreg_impl: str = "author"
+    # If True, drop incomplete val batches (faster DDP); default False for metric parity vs single-GPU
+    val_drop_last: bool = False
+    sigreg_n_slices: int = 1024
+    sigreg_t_max: float = 3.0
+    sigreg_n_points: int = 17
+
     @classmethod
     def from_hydra(cls, cfg) -> "TrainerConfig":
         """Create config from Hydra DictConfig."""
+        mn = str(cfg.get("model_name", "vit_large_patch16_224")).lower()
+        default_wd = 5e-2 if mn.startswith("vit") else 5e-4
         return cls(
             model_name=cfg.get("model_name", "vit_large_patch16_224"),
             proj_dim=cfg.get("proj_dim", 512),
             bs=cfg.get("bs", 256),
             epochs=cfg.get("epochs", 100),
             lr=cfg.get("lr", 5e-4),
-            weight_decay=cfg.get("weight_decay", 1e-2),
+            weight_decay=cfg.get("weight_decay", default_wd),
+            optimizer=str(cfg.get("optimizer", "adamw")).lower(),
+            lr_probe=cfg.get("lr_probe", 3e-3),
+            momentum=cfg.get("momentum", 0.9),
+            cosine_eta_min_ratio=cfg.get("cosine_eta_min_ratio", 0.001),
             grad_accum=cfg.get("grad_accum", 1),
             max_grad_norm=cfg.get("max_grad_norm", 3.0),
             dataset=cfg.get("dataset", "imagenet-1k"),
@@ -127,6 +187,7 @@ class TrainerConfig:
             V_global=cfg.get("V_global", 2),
             V_local=cfg.get("V_local", 6),
             V_mixed=cfg.get("V_mixed", 0),
+            V_neighbor=cfg.get("V_neighbor", 0),
             global_img_size=cfg.get("global_img_size", 224),
             local_img_size=cfg.get("local_img_size", 98),
             device=cfg.get("device", "cuda"),
@@ -138,6 +199,17 @@ class TrainerConfig:
             seed=cfg.get("seed", 0),
             use_swa=cfg.get("use_swa", False),
             reproducible=cfg.get("reproducible", False),
+            torch_compile=cfg.get("torch_compile", True),
+            global_rrc_min=cfg.get("global_rrc_min", 0.3),
+            global_rrc_max=cfg.get("global_rrc_max", 1.0),
+            local_rrc_min=cfg.get("local_rrc_min", 0.05),
+            local_rrc_max=cfg.get("local_rrc_max", 0.3),
+            solarize_p=cfg.get("solarize_p", 0.2),
+            sigreg_impl=str(cfg.get("sigreg_impl", "author")).lower(),
+            sigreg_n_slices=cfg.get("sigreg_n_slices", 1024),
+            sigreg_t_max=cfg.get("sigreg_t_max", 3.0),
+            sigreg_n_points=cfg.get("sigreg_n_points", 17),
+            val_drop_last=cfg.get("val_drop_last", False),
         )
 
 
@@ -167,16 +239,13 @@ class BaseTrainer(L.LightningModule):
         # Models (no .to(device) - Lightning handles this)
         self.encoder = encoder
         self.probe = self._build_probe()
-        self.encoder = torch.compile(
-            self.encoder,
-            mode="default",
-            fullgraph=False,
-        )
-        self.probe = torch.compile(
-            self.probe,
-            mode="default",
-            fullgraph=False,
-        )
+
+        # Second torch.compile pass: Encoder already compiles backbone + proj in encoder.py;
+        # wrapping the full module here yields a whole-graph compile for training_step / validation.
+        # run_training_loop.py sets torch._dynamo.config.optimize_ddp = False for Dynamo + DDP safety.
+        if config.torch_compile:
+            self.encoder = torch.compile(self.encoder, mode="default", fullgraph=False)
+            self.probe = torch.compile(self.probe, mode="default", fullgraph=False)
 
         # Optional SWA encoder for producing stable target embeddings (z̄).
         # Only the averaged parameters are used; no gradients flow through it.
@@ -199,7 +268,29 @@ class BaseTrainer(L.LightningModule):
         self.test_ds = None
         self._phn_dataset = None
         self._phn_sampler = None
-            
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Soft checkpoint loading: checkpoint weights win; model keys absent from the
+        checkpoint keep their initialised values; unexpected checkpoint keys are ignored.
+        This allows resuming across minor architecture changes (e.g. a dormant module
+        added after the checkpoint was saved, such as output_bn)."""
+        ckpt_sd = checkpoint["state_dict"]
+        model_sd = self.state_dict()
+        merged = {**model_sd, **{k: v for k, v in ckpt_sd.items() if k in model_sd}}
+        missing = [k for k in model_sd if k not in ckpt_sd]
+        extra   = [k for k in ckpt_sd  if k not in model_sd]
+        if missing or extra:
+            logging.warning(
+                "on_load_checkpoint: %d missing keys (keeping init values), "
+                "%d unexpected keys (ignored) — likely a benign architecture delta.",
+                len(missing), len(extra),
+            )
+            if missing:
+                logging.warning("  missing: %s", missing[:8])
+            if extra:
+                logging.warning("  extra:   %s", extra[:8])
+        checkpoint["state_dict"] = merged
+
     @abstractmethod
     def compute_loss(
         self,
@@ -231,13 +322,27 @@ class BaseTrainer(L.LightningModule):
         """Lightning hook called at the beginning of fit/test.
 
         Priority for training dataset:
-          1. PHN (neighbor views) → MixedViewDataset
+          1. PHN (neighbor views) → NeighborViewDataset
           2. Mixed/cross-instance  → CrossInstanceDataset
           3. Default               → HFDataset
         """
         if stage != "fit":
             return
         cfg = self.config
+        # HF Datasets: populate cache on local rank 0 only, then barrier, so ranks do not
+        # concurrently write the same HF_DATASETS_CACHE (NFS stale handles / lock races).
+        tw = getattr(self.trainer, "world_size", None) if self.trainer is not None else None
+        if tw is not None and int(tw) > 1 and dist.is_initialized():
+            local_rank = int(
+                os.environ.get(
+                    "LOCAL_RANK",
+                    getattr(self.trainer, "local_rank", 0),
+                )
+            )
+            if local_rank == 0:
+                prepare_hf_dataset_cache(cfg.dataset)
+            dist.barrier()
+
         test_split = "test" if cfg.dataset == "cifar10" else "val"
 
         if _is_phn(cfg):
@@ -256,20 +361,28 @@ class BaseTrainer(L.LightningModule):
                 nbr_idx.tolist(),
                 [f"{s:.4f}" for s in nbr_sim.tolist()],
             )
-            self.train_ds = MixedViewDataset(
+            self.train_ds = NeighborViewDataset(
                 split="train",
                 neighbor_index=neighbor_index,
                 V_global=cfg.V_global,
                 V_self=cfg.V_local,
-                V_neighbor=getattr(cfg, "V_neighbor", 2),
+                V_neighbor=getattr(cfg, "V_neighbor", 0),
                 p=getattr(cfg, "phn_p", 64),
                 min_similarity=getattr(cfg, "phn_min_similarity", 0.0),
                 neighbor_sampling=getattr(cfg, "phn_neighbor_sampling", "uniform"),
                 neighbor_start_epoch=getattr(cfg, "phn_neighbor_start_epoch", 0),
+                warmup_V_self=getattr(cfg, "phn_warmup_V_local", None),
                 global_img_size=cfg.global_img_size,
                 local_img_size=cfg.local_img_size,
                 dataset=cfg.dataset,
                 seed=cfg.seed,
+                neighbor_same_label_only=getattr(
+                    cfg, "phn_neighbor_same_label_only", False
+                ),
+                global_rrc_min=cfg.global_rrc_min,
+                global_rrc_max=cfg.global_rrc_max,
+                local_rrc_min=cfg.local_rrc_min,
+                local_rrc_max=cfg.local_rrc_max,
             )
             self._phn_dataset = self.train_ds
             # Cross-check: do image 0's neighbors have the same label?
@@ -295,6 +408,10 @@ class BaseTrainer(L.LightningModule):
                 global_img_size=cfg.global_img_size,
                 dataset=cfg.dataset,
                 seed=cfg.seed,
+                global_rrc_min=cfg.global_rrc_min,
+                global_rrc_max=cfg.global_rrc_max,
+                local_rrc_min=cfg.local_rrc_min,
+                local_rrc_max=cfg.local_rrc_max,
             )
         else:
             self.train_ds = HFDataset(
@@ -305,6 +422,10 @@ class BaseTrainer(L.LightningModule):
                 global_img_size=cfg.global_img_size,
                 dataset=cfg.dataset,
                 seed=cfg.seed,
+                global_rrc_min=cfg.global_rrc_min,
+                global_rrc_max=cfg.global_rrc_max,
+                local_rrc_min=cfg.local_rrc_min,
+                local_rrc_max=cfg.local_rrc_max,
             )
 
         self.test_ds = HFDataset(
@@ -315,6 +436,10 @@ class BaseTrainer(L.LightningModule):
             global_img_size=cfg.global_img_size,
             dataset=cfg.dataset,
             seed=cfg.seed,
+            global_rrc_min=cfg.global_rrc_min,
+            global_rrc_max=cfg.global_rrc_max,
+            local_rrc_min=cfg.local_rrc_min,
+            local_rrc_max=cfg.local_rrc_max,
         )
     
     def _build_probe(self) -> nn.Module:
@@ -339,8 +464,23 @@ class BaseTrainer(L.LightningModule):
         
         With DDP, each GPU runs independently with its own dataloader.
         To achieve an effective batch size of `bs`, each GPU should process `bs // world_size`.
+        Uses Lightning's ``trainer.world_size`` when attached (matches PosBatchSampler); falls
+        back to ``config.world_size`` before the trainer exists.
         """
-        world_size = self.config.world_size if self.config.distributed else 1
+        if self.config.distributed:
+            world_size = self.config.world_size
+            if self.trainer is not None:
+                tw = int(self.trainer.world_size)
+                if tw != world_size:
+                    logging.warning(
+                        "trainer.world_size (%d) != config.world_size (%d); using trainer.world_size "
+                        "for per-device batch size",
+                        tw,
+                        world_size,
+                    )
+                world_size = tw
+        else:
+            world_size = 1
         per_device_bs = self.config.bs // world_size
         if per_device_bs == 0:
             raise ValueError(f"Batch size {self.config.bs} is too small for {world_size} GPUs")
@@ -414,7 +554,13 @@ class BaseTrainer(L.LightningModule):
             prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
             collate_fn=collate_views,
         )
-        if getattr(cfg, "reproducible", False) and cfg.num_workers > 0:
+        if isinstance(self.train_ds, CrossInstanceDataset):
+            # set_rank must happen before workers fork so _rank is correct in __getitem__.
+            rank = self.trainer.global_rank if self.trainer is not None else 0
+            self.train_ds.set_rank(rank)
+            if cfg.num_workers > 0:
+                kw["worker_init_fn"] = _make_cross_instance_worker_init_fn(cfg.seed)
+        elif getattr(cfg, "reproducible", False) and cfg.num_workers > 0:
             kw["worker_init_fn"] = _make_worker_init_fn(cfg.seed)
         return DataLoader(self.train_ds, **kw)
 
@@ -431,10 +577,10 @@ class BaseTrainer(L.LightningModule):
             batch_size=self.per_device_batch_size,
             shuffle=False,
             sampler=sampler,
-            drop_last=cfg.distributed,
+            drop_last=bool(cfg.val_drop_last),
             num_workers=cfg.num_workers,
             pin_memory=True,
-            persistent_workers=cfg.num_workers > 0,
+            # persistent_workers=cfg.num_workers > 0,
             prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         )
         if getattr(cfg, "reproducible", False) and cfg.num_workers > 0:
@@ -442,6 +588,10 @@ class BaseTrainer(L.LightningModule):
         return DataLoader(self.test_ds, **kw)
 
     def on_train_epoch_start(self):
+        if self.logger and hasattr(self.logger, 'experiment'):
+            self.logger.experiment.define_metric("*", step_metric="trainer/global_step")
+            # Offset all future logs by the checkpoint's global step
+        self._wandb_step_offset = self.global_step
         """Advance per-epoch seeds for PHN neighbor sampling and PosBatchSampler."""
         if self._phn_sampler is not None:
             self._phn_sampler.set_epoch(self.current_epoch)
@@ -450,8 +600,12 @@ class BaseTrainer(L.LightningModule):
             start_epoch = getattr(self.config, "phn_neighbor_start_epoch", 0)
             if start_epoch > 0 and self.current_epoch == start_epoch:
                 logging.info(
-                    "PHN curriculum: introducing neighbor views at epoch %d",
+                    "PHN curriculum: epoch %d → %d self + %d neighbor local views "
+                    "(warmup was %d self-only)",
                     self.current_epoch,
+                    getattr(self.train_ds, "V_self", self.config.V_local),
+                    getattr(self.train_ds, "V_neighbor", 0),
+                    getattr(self.train_ds, "V_self_warmup", self.config.V_local),
                 )
                 # Save model weights at transition (pure self-view checkpoint)
                 if self.trainer.is_global_zero:
@@ -465,82 +619,141 @@ class BaseTrainer(L.LightningModule):
                         path = os.path.join(ckpt_dir, f"epoch_{start_epoch}_pre_phn.ckpt")
                         self.trainer.save_checkpoint(path)
                         logging.info("Saved pre-PHN checkpoint to %s", path)
-    
+        if isinstance(self.train_ds, CrossInstanceDataset):
+            # Update shared-memory epoch counter so persistent worker processes
+            # see the new epoch in __getitem__ without being respawned.
+            self.train_ds.set_epoch(self.current_epoch)
+
     def _build_gpu_aug_global(self) -> v2.Compose:
         """Build GPU augmentation pipeline for global views."""
+        sp = float(self.config.solarize_p)
         return v2.Compose([
             v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
             v2.RandomGrayscale(p=0.2),
             v2.RandomApply([v2.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5),
-            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
+            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=sp),
             v2.ToDtype(torch.bfloat16, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     
     def _build_gpu_aug_local(self) -> v2.Compose:
         """Build GPU augmentation pipeline for local views."""
+        sp = float(self.config.solarize_p)
         return v2.Compose([
             v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
             v2.RandomGrayscale(p=0.2),
-            v2.RandomApply([v2.GaussianBlur(kernel_size=9, sigma=(0.1, 2.0))], p=0.5),
-            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
+            v2.RandomApply([v2.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5),
+            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=sp),
 
             v2.ToDtype(torch.bfloat16, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     
-    def configure_optimizers(self):
-        """AdamW with linear warm-up + cosine annealing on LR only.
+    def _build_warmup_cosine_lambda_scheduler(self, optimizer: torch.optim.Optimizer) -> LambdaLR:
+        """10-epoch linear warmup (0.01→1.0 scale) then cosine to ``cosine_eta_min_ratio``.
 
-        Weight decay is held constant (no schedule) per paper Section 6.1.
-        5e-2 for ViT, 5e-4 for ResNet/ConvNeXt. Final LR = lr/1000.
+        One shared multiplier for all param groups so encoder vs probe LR ratio is fixed.
         """
-        model_name = self.config.model_name.lower()
-        wd = 5e-2 if model_name.startswith("vit") else 5e-4
-        optimizer = torch.optim.AdamW([
-            {
-                'params': self.encoder.parameters(),
-                'lr': self.config.lr,
-                'weight_decay': wd,
-                'betas': (0.9, 0.95),
-            },
-            {
-                'params': self.probe.parameters(),
-                'lr': 3e-3,
-                'weight_decay': 0.0,
-                'betas': (0.9, 0.95),
-            }
-        ])
-        
+        cfg = self.config
         steps_per_epoch = (
-            len(self.train_ds) // self.config.bs // self.config.grad_accum
+            len(self.train_ds) // cfg.bs // cfg.grad_accum
         )
-        warmup_steps = steps_per_epoch * 10  # 10 epoch warmup
-        total_steps = steps_per_epoch * self.trainer.max_epochs
-        
-        warmup_scheduler = LinearLR(
-            optimizer, 
-            start_factor=0.01, 
-            total_iters=warmup_steps
+        warmup_steps = steps_per_epoch * 10
+        max_epochs = (
+            self.trainer.max_epochs if self.trainer is not None else cfg.epochs
         )
-        eta_min = self.config.lr / 1000
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer, 
-            T_max=total_steps - warmup_steps, 
-            eta_min=eta_min
-        )
-        scheduler = SequentialLR(
-            optimizer, 
-            schedulers=[warmup_scheduler, cosine_scheduler], 
-            milestones=[warmup_steps]
-        )
-        
+        total_steps = steps_per_epoch * max_epochs
+        eta_min_ratio = float(cfg.cosine_eta_min_ratio)
+
+        def lr_lambda(step: int) -> float:
+            step = int(step)
+            if step < warmup_steps:
+                return 0.01 + (step / max(1, warmup_steps)) * (1.0 - 0.01)
+            t = step - warmup_steps
+            T = max(1, total_steps - warmup_steps)
+            p = min(1.0, t / T)
+            cosine = 0.5 * (1 + math.cos(math.pi * p))
+            return eta_min_ratio + (1.0 - eta_min_ratio) * cosine
+
+        n = len(optimizer.param_groups)
+        return LambdaLR(optimizer, lr_lambda=[lr_lambda] * n)
+
+    def configure_optimizers(self):
+        """AdamW or LARS with 10-epoch warmup + cosine decay (step-based).
+
+        AdamW: ``SequentialLR`` (LinearLR + CosineAnnealingLR) — legacy behavior.
+        LARS (LpJEPA / You et al., 2017): ``timm.optim.lars.Lars`` + shared
+        ``LambdaLR`` schedule; encoder ``lr``, probe ``lr_probe``, ``momentum``,
+        ``weight_decay`` on encoder only unless overridden.
+
+        Weight decay for AdamW: ``TrainerConfig.weight_decay``; defaults in
+        ``from_hydra`` are 5e-2 for ViT and 5e-4 for non-ViT when unset.
+        """
+        cfg = self.config
+        wd = cfg.weight_decay
+        lr_p = cfg.lr_probe
+
+        if cfg.optimizer.lower() == "lars":
+            optimizer = Lars(
+                [
+                    {"params": self.encoder.parameters(), "lr": cfg.lr, "weight_decay": wd},
+                    {"params": self.probe.parameters(), "lr": lr_p, "weight_decay": 0.0},
+                ],
+                lr=cfg.lr,
+                momentum=float(cfg.momentum),
+                weight_decay=0.0,
+            )
+            scheduler = self._build_warmup_cosine_lambda_scheduler(optimizer)
+        else:
+            optimizer = torch.optim.AdamW(
+                [
+                    {
+                        "params": self.encoder.parameters(),
+                        "lr": cfg.lr,
+                        "weight_decay": wd,
+                        "betas": (0.9, 0.999),
+                    },
+                    {
+                        "params": self.probe.parameters(),
+                        "lr": lr_p,
+                        "weight_decay": 0.0,
+                        "betas": (0.9, 0.999),
+                    },
+                ]
+            )
+
+            steps_per_epoch = (
+                len(self.train_ds) // cfg.bs // cfg.grad_accum
+            )
+            warmup_steps = steps_per_epoch * 10
+            max_epochs = (
+                self.trainer.max_epochs if self.trainer is not None else cfg.epochs
+            )
+            total_steps = steps_per_epoch * max_epochs
+
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.01,
+                total_iters=warmup_steps,
+            )
+            eta_min = cfg.lr / 1000
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps - warmup_steps,
+                eta_min=eta_min,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_steps],
+            )
+
         return {
-            'optimizer': optimizer, 
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'interval': 'step',
-            }
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
         }
     
     def training_step(self, batch, batch_idx):
@@ -548,9 +761,15 @@ class BaseTrainer(L.LightningModule):
         vs, y = batch
         cfg = self.config
 
-        # Separate views by resolution
-        global_views = [vs[i] for i in range(len(vs)) if vs[i].shape[-1] == cfg.global_img_size]
-        local_views = [vs[i] for i in range(len(vs)) if vs[i].shape[-1] == cfg.local_img_size]
+        # Collate order: globals first (all global_img_size), then locals (mixed + local).
+        # Index split avoids duplicating views when global_img_size == local_img_size and V_local=0.
+        vg = cfg.V_global
+        if len(vs) < vg:
+            raise ValueError(
+                f"Expected at least {vg} global view tensors, got {len(vs)}"
+            )
+        global_views = vs[:vg]
+        local_views = vs[vg:]
         
         # Apply GPU augmentations
         global_views = [self.gpu_aug_global(g) for g in global_views]
@@ -591,6 +810,17 @@ class BaseTrainer(L.LightningModule):
         if self.use_swa:
             self.swa_encoder.update_parameters(self.encoder)
     
+    def on_before_optimizer_step(self, optimizer):
+        """Log the pre-clip gradient norm at each step."""
+        norms = [
+            p.grad.norm().item()
+            for g in optimizer.param_groups
+            for p in g["params"]
+            if p.grad is not None
+        ]
+        if norms:
+            self.log("train/grad_norm", max(norms), on_step=True, on_epoch=False)
+
     def on_save_checkpoint(self, checkpoint):
         """Lightning hook for saving additional state."""
         checkpoint['best_acc'] = self.best_acc
@@ -617,7 +847,32 @@ class JEPATrainer(BaseTrainer):
         hydra_cfg: Optional[Any] = None,
     ):
         super().__init__(encoder, config, hydra_cfg)
-        self.sigreg = SIGReg()
+        # Store flag using the pre-compilation parameter; self.encoder may be a
+        # CompiledModule after BaseTrainer.__init__ runs torch.compile, which would
+        # break isinstance checks later.
+        self._is_author_lejepa = isinstance(encoder, AuthorLeJEPA)
+        # When the encoder is the author's LeJEPA module it owns sigreg internally;
+        # only create a standalone sigreg for legacy / weighted_hybrid paths.
+        if self._is_author_lejepa:
+            self.sigreg = None  # owned by self.encoder.sigreg
+        else:
+            _sig = getattr(config, "sigreg_impl", "author")
+            if _sig == "author" and config.reg == "hybrid":
+                logging.warning(
+                    "sigreg_impl=author is not supported for reg=hybrid (per-view SIGReg); "
+                    "using legacy SIGReg"
+                )
+                self.sigreg = SIGReg()
+            elif _sig == "author":
+                from losses.lejepa import SlicedEppsPulley
+
+                self.sigreg = SlicedEppsPulley(
+                    num_slices=config.sigreg_n_slices,
+                    t_max=config.sigreg_t_max,
+                    n_points=config.sigreg_n_points,
+                )
+            else:
+                self.sigreg = SIGReg()
         self.lamb = lamb
         self.w = w
 
@@ -630,17 +885,38 @@ class JEPATrainer(BaseTrainer):
         local_views: List[torch.Tensor],
         labels: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-    
-        # Forward through encoder
+
+        # ── Author LeJEPA path ──────────────────────────────────────────────
+        if self._is_author_lejepa:
+            output = self.encoder(global_views=global_views, local_views=local_views)
+            ssl_loss    = output.loss
+            pred_loss   = output.inv_loss
+            sigreg_loss = output.sigreg_loss
+            with torch.no_grad():
+                self.log("train/proj_norm_mean", output.embedding.norm(dim=-1).mean(),
+                         on_step=True, on_epoch=False, sync_dist=True)
+            # Probe on global backbone features (output.embedding = g_features.detach())
+            # shape: (N * V_global, feat_dim)
+            y_rep = labels.repeat(self.config.V_global)
+            probe_loss = F.cross_entropy(self.probe(output.embedding), y_rep)
+            total_loss = ssl_loss + probe_loss
+            return {
+                "total_loss": total_loss,
+                "sigreg_loss": sigreg_loss,
+                "prediction_loss": pred_loss,
+                "probe_loss": probe_loss,
+            }
+
+        # ── Legacy / hybrid paths ───────────────────────────────────────────
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
-        
-        if self.config.distributed:
-            gathered_proj = self.all_gather(all_proj, sync_grads=True)
-            gathered_emb = self.all_gather(all_emb, sync_grads=True)
-            all_proj = gathered_proj.flatten(0, 1)
-            all_emb = gathered_emb.flatten(0, 1)
-            labels = self.all_gather(labels, sync_grads=False).flatten(0, 1)
+
+        with torch.no_grad():
+            proj_flat = all_proj.detach().flatten(0, 1)
+            self.log("train/proj_norm_mean", proj_flat.norm(dim=-1).mean(),
+                     on_step=True, on_epoch=False, sync_dist=True)
+            self.log("train/proj_std", proj_flat.std(dim=0).mean(),
+                     on_step=True, on_epoch=False, sync_dist=True)
 
         global_proj = all_proj[:, :self.config.V_global, :]
 
@@ -651,18 +927,25 @@ class JEPATrainer(BaseTrainer):
                 _, swa_proj = self.swa_encoder(global_views)
                 swa_target = swa_proj.mean(dim=1, keepdim=True)  # (N, 1, D)
 
-        if self.config.reg == "weighted_hybrid":
-            ssl_loss, lejepa_loss, cl_loss, sigreg_loss = weighted_hybrid(
-                global_proj, all_proj, self.sigreg, w=self.w, lamb=self.lamb
+        if (
+            getattr(self.config, "sigreg_impl", "author") == "author"
+            and self.config.reg == "LeJEPA"
+        ):
+            ssl_loss, pred_loss, sigreg_loss = compute_author_lejepa_loss(
+                all_proj,
+                self.config.V_global,
+                self.sigreg,
+                self.lamb,
+                target=swa_target,
             )
-            pred_loss = lejepa_loss
+            # cl_loss = torch.tensor(0.0, device=all_proj.device)
         else:
             ssl_loss, pred_loss, sigreg_loss = LeJEPA(
                 all_proj, self.config.V_global, self.sigreg, self.lamb, reg=self.config.reg,
                 target=swa_target,
                 global_step=self.global_step,
             )
-            cl_loss = torch.tensor(0.0, device=all_proj.device)
+            # cl_loss = torch.tensor(0.0, device=all_proj.device)
 
         # Compute probe loss
         if getattr(self.config, "V_neighbor", 0) > 0:
@@ -678,9 +961,23 @@ class JEPATrainer(BaseTrainer):
             "total_loss": total_loss,
             "sigreg_loss": sigreg_loss,
             "prediction_loss": pred_loss,
-            "cl_loss": cl_loss,
+            # "cl_loss": cl_loss,
             "probe_loss": probe_loss,
         }
+
+    def validation_step(self, batch, batch_idx):
+        """Override: for AuthorLeJEPA use backbone directly; otherwise defer to BaseTrainer."""
+        vs, y = batch
+        if self._is_author_lejepa:
+            # eval mode: AuthorLeJEPA.forward(images=) returns backbone embedding directly
+            emb_flat = self.encoder(images=vs[0]).embedding  # (N, feat_dim)
+        else:
+            emb, _ = self.encoder(vs)
+            emb_flat = emb.flatten(0, 1)
+        logits = self.probe(emb_flat)
+        acc = (logits.argmax(1) == y).float().mean()
+        self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        return {"emb": emb_flat, "labels": y}
 
 
 class LpJEPATrainer(BaseTrainer):
@@ -747,15 +1044,6 @@ class LpJEPATrainer(BaseTrainer):
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
 
-        # DDP gather: standard LpJEPA gathers only all_emb/labels (for probe);
-        # RDMReg gather happens inside rectified_lp_jepa_loss via misc.gather.
-        # lp_hybrid needs full batch for SimCLR, so we gather all_proj too.
-        if self.config.distributed:
-            gathered_emb = self.all_gather(all_emb, sync_grads=True)
-            all_emb = gathered_emb.flatten(0, 1)
-            labels = self.all_gather(labels, sync_grads=False).flatten(0, 1)
-            all_proj = gather(all_proj)  # flatten only if (N,V,D) -> need (N*V, D) for downstream
-
         global_proj = all_proj[:, :self.config.V_global, :]
         local_proj = all_proj[:, self.config.V_global:, :]
 
@@ -813,17 +1101,7 @@ class SimCLRTrainer(BaseTrainer):
 
         all_views = global_views + local_views
         all_emb, all_proj = self.encoder(all_views)
-        
-        # Gather across GPUs if using DDP (Lightning auto-detects)
-        if self.config.distributed:
-            gathered_proj = self.all_gather(all_proj, sync_grads=True)
-            gathered_labels = self.all_gather(labels, sync_grads=False)
-            gathered_emb = self.all_gather(all_emb, sync_grads=True) 
-            
-            all_proj = gathered_proj.flatten(0, 1)
-            all_emb = gathered_emb.flatten(0, 1)  
-            labels = gathered_labels.flatten(0, 1)
-            
+
         global_proj = all_proj[:, :self.config.V_global, :]
         local_proj = all_proj[:, self.config.V_global:, :]
         

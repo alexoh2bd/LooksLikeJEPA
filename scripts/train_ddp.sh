@@ -2,13 +2,13 @@
 #SBATCH --job-name=ddp_train
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=4
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=40G
+#SBATCH --mem=64G
 #SBATCH --time=320:00:00
 #SBATCH --partition=compsci-gpu
-#SBATCH --gres=gpu:a5000:4
+#SBATCH --gres=gpu:rtx_pro_6000:2
 
 # ===========================================================================
 # Fail fast
@@ -58,16 +58,16 @@ export NCCL_DEBUG=INFO                     # INFO for first run to verify IB; sw
 # export NCCL_DEBUG=WARN
 
 # ===========================================================================
-# HF dataset cache — node-local /tmp avoids NFS "stale file handle" errors
+# HF dataset cache — node-local scratch avoids NFS "stale file handle" errors
 #
-#   Each node gets its own cache. This is fine because HF datasets are
-#   read-only after the first load. Both nodes will independently load
-#   from the parquet shards on the shared filesystem into their local /tmp.
-#   If you see load imbalance, switch to a shared NFS path instead:
-#     export HF_DATASETS_CACHE=/path/on/shared/nfs/hf_cache
+#   Prefer SLURM_TMPDIR (per-node job scratch) when the scheduler sets it; else /tmp.
+#   Each node has its own directory. Ranks on a node share one cache dir; Python
+#   serializes prep on local rank 0 then barrier (see prepare_hf_dataset_cache in ds.py).
+#   Shared NFS cache (if you must): set HF_DATASETS_CACHE to the NFS path and add
 #     export HF_DATASETS_DISABLE_FILE_LOCKING=1
 # ===========================================================================
-export HF_DATASETS_CACHE=/tmp/hf_datasets_${SLURM_JOB_ID}
+: "${SLURM_TMPDIR:=/tmp}"
+export HF_DATASETS_CACHE="${SLURM_TMPDIR}/hf_datasets_${SLURM_JOB_ID}"
 mkdir -p "$HF_DATASETS_CACHE"
 
 # ===========================================================================
@@ -81,6 +81,36 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 which python
 python --version
 
+
+srun uv run python src/run_training_loop.py \
+  +reg=LeJEPA \
+  +model_name=vit_large_patch14_224 \
+  +dataset=imagenet-1k \
+  +epochs=100 \
+  +bs=512 \
+  +lr=5e-4 \
+  +weight_decay=5e-2 \
+  +lamb=0.02 \
+  +V_global=2 \
+  +V_local=6\
+  +V_mixed=0 \
+  +global_img_size=224 \
+  +local_img_size=98 \
+  +proj_dim=512 \
+  +grad_accum=1 \
+  +num_workers=7 \
+  +prefetch_factor=2 \
+  +device=cuda \
+  +distributed=True \
+  +world_size=2\
+  +num_nodes=1\
+  +seed=0 \
+  +log_interval=50 \
+  +use_swa=False \
+  +torch_compile=true \
+  +ckpt_every_n_epochs=2 \
+  +sigreg_impl=author
+
 # ===========================================================================
 # Training — LeJEPA baseline (no PHN)
 #
@@ -90,6 +120,41 @@ python --version
 #     - local_img_size=98      (repo default)
 #     - proj_dim=64            (Table 1d best)
 #     - 1024 slices, [-5,5], 17 integration points (your SIGReg defaults)
+# ===========================================================================
+# srun uv run python src/run_training_loop.py \
+#   +reg=LeJEPA \
+#   +model_name=vit_large_patch14_224 \
+#   +dataset=imagenet-1k \
+#   +epochs=100 \
+#   +bs=512 \
+#   +lr=5e-4 \
+#   +weight_decay=5e-2 \
+#   +lamb=0.05 \
+#   +V_global=2 \
+#   +V_local=6\
+#   +V_mixed=0 \
+#   +global_img_size=224 \
+#   +local_img_size=98 \
+#   +proj_dim=512 \
+#   +grad_accum=1 \
+#   +num_workers=7 \
+#   +prefetch_factor=2 \
+#   +device=cuda \
+#   +distributed=True \
+#   +world_size=2\
+#   +num_nodes=1\
+#   +seed=0 \
+#   +log_interval=50 \
+#   +use_swa=False \
+#   +torch_compile=true \
+#   +ckpt_every_n_epochs=2 \
+#   +sigreg_impl=legacy
+
+# ===========================================================================
+# Training — PHN (uncomment to run instead of baseline)
+#
+#   Same hyperparameters as baseline, plus neighbor views.
+#   Comment out the baseline srun above and uncomment this block.
 # ===========================================================================
 # srun uv run src/run_training_loop.py \
 #   +reg=LeJEPA \
@@ -101,58 +166,31 @@ python --version
 #   +weight_decay=5e-2 \
 #   +lamb=0.05 \
 #   +V_global=2 \
-#   +V_local=6 \
+#   +V_local=5 \
 #   +V_mixed=0 \
 #   +global_img_size=224 \
 #   +local_img_size=98 \
 #   +proj_dim=512 \
 #   +grad_accum=1 \
 #   +num_workers=7 \
-#   +prefetch_factor=2 \
+#   +prefetch_factor=3 \
 #   +device=cuda \
 #   +distributed=True \
 #   +world_size=8 \
 #   +num_nodes=2 \
 #   +seed=0 \
 #   +log_interval=200 \
-#   +use_swa=False
-
-# ===========================================================================
-# Training — PHN (uncomment to run instead of baseline)
-#
-#   Same hyperparameters as baseline, plus neighbor views.
-#   Comment out the baseline srun above and uncomment this block.
-# ===========================================================================
-srun uv run src/run_training_loop.py \
-  +reg=LeJEPA \
-  +model_name=vit_large_patch14_224 \
-  +dataset=imagenet-1k \
-  +epochs=100 \
-  +bs=512 \
-  +lr=5e-4 \
-  +weight_decay=5e-2 \
-  +lamb=0.05 \
-  +V_global=2 \
-  +V_local=4 \
-  +V_mixed=0 \
-  +global_img_size=224 \
-  +local_img_size=98 \
-  +proj_dim=512 \
-  +grad_accum=1 \
-  +num_workers=7 \
-  +prefetch_factor=3 \
-  +device=cuda \
-  +distributed=True \
-  +world_size=8 \
-  +num_nodes=2 \
-  +seed=0 \
-  +log_interval=200 \
-  +use_swa=False \
-  +phn=True \
-  +phn_neighbor_indices_path="data/b3/imagenet1k_qwen3_vl/ranks/neighbors.npy" \
-  +phn_neighbor_scores_path="data/b3/imagenet1k_qwen3_vl/ranks/neighbor_scores.npy" \
-  +phn_p=64 \
-  +V_neighbor=2 \
-  +phn_neighbor_sampling="uniform" \
-  +phn_pos_only=False \
-  +phn_neighbor_start_epoch=20
+#   +use_swa=False \
+#   +phn=True \
+#   +phn_neighbor_indices_path="data/b3/imagenet1k_qwen3_vl/ranks/neighbors.npy" \
+#   +phn_neighbor_scores_path="data/b3/imagenet1k_qwen3_vl/ranks/neighbor_scores.npy" \
+#   +phn_p=64 \
+#   +V_neighbor=1 \
+#   +phn_neighbor_sampling="uniform" \
+#   +phn_pos_only=False \
+#   +phn_neighbor_same_label_only=False \
+#   +ckpt_every_n_epochs=2
+#   # Warmup: 6 self-only locals (auto = V_local+V_neighbor), then 4 self + 2 neighbor.
+#   # Override with +phn_warmup_V_local=6 if needed.
+#   # phn_neighbor_same_label_only: neighbor pool = top-phn_p teacher ranks ∩ same class as anchor.
+#   #   +phn_neighbor_start_epoch=20 \

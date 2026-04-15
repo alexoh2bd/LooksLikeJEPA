@@ -1,4 +1,4 @@
-"""MixedViewDataset — injects neighbor-local views into LeJEPA training.
+"""NeighborViewDataset — injects neighbor-local views into LeJEPA training.
 
 Each sample produces:
   - V_global  global views   (224×224) from the anchor image
@@ -34,6 +34,14 @@ Neighbor sampling modes
 uniform  (default)  — uniform random draw from the positive pool
 weighted            — draw proportional to softmax-normalised cosine similarities
 top                 — always pick the top-V_neighbor most similar neighbors
+
+Same-label neighbor pool (optional)
+-----------------------------------
+If ``neighbor_same_label_only=True``, the positive pool from ``get_positives``
+(ranks ``[0, p)``) is intersected with images that share the anchor's class
+label — a minimal "mixed + neighbor" scheme: teacher-ranked neighbors, but
+only same-class instances (like ``CrossInstanceDataset`` mixed views, but
+restricted to the top-*p* ranking).
 """
 
 from __future__ import annotations
@@ -51,7 +59,7 @@ from neighbor_index import NeighborIndex
 logger = logging.getLogger(__name__)
 
 
-class MixedViewDataset(HFDataset):
+class NeighborViewDataset(HFDataset):
     """HFDataset extended with teacher-guided neighbor local views.
 
     Parameters
@@ -77,8 +85,14 @@ class MixedViewDataset(HFDataset):
         ``"weighted"`` — draw proportional to softmax(similarities).
         ``"top"``      — always take the first V_neighbor entries in the pool.
     neighbor_start_epoch:
-        Curriculum: use only self-views for epochs < this value, then introduce
-        neighbor views. Set to 0 to disable (neighbors from epoch 0).
+        Curriculum: for epochs < this value, use ``warmup_V_self`` self locals only
+        (no neighbors); from this epoch onward use ``V_self`` self locals plus
+        ``V_neighbor`` neighbor locals. Set to 0 to disable (neighbors from epoch 0).
+    warmup_V_self:
+        Number of self local crops during the warmup phase. If ``None`` and
+        ``neighbor_start_epoch > 0`` and ``V_neighbor > 0``, defaults to
+        ``V_self + V_neighbor`` so total local count matches the post-warmup phase
+        (e.g. 6 self-only then 4 self + 2 neighbor).
     global_img_size:
         Spatial size of global crops (default 224).
     local_img_size:
@@ -87,6 +101,9 @@ class MixedViewDataset(HFDataset):
         Dataset identifier passed to ``HFDataset._get_ds`` (e.g. ``"inet100"``).
     seed:
         Base random seed.  Varied per epoch via ``set_epoch()``.
+    neighbor_same_label_only:
+        If True, restrict the top-*p* neighbor pool to images with the same
+        class label as the anchor (mixed-instance + teacher rank).
     """
 
     def __init__(
@@ -100,10 +117,12 @@ class MixedViewDataset(HFDataset):
         min_similarity: float = 0.0,
         neighbor_sampling: Literal["uniform", "weighted", "top"] = "uniform",
         neighbor_start_epoch: int = 0,
+        warmup_V_self: int | None = None,
         global_img_size: int = 224,
         local_img_size: int = 96,
         dataset: str = "inet100",
         seed: int = 0,
+        neighbor_same_label_only: bool = False,
     ) -> None:
         # Initialise parent: loads the HF dataset + builds transforms
         super().__init__(
@@ -125,17 +144,32 @@ class MixedViewDataset(HFDataset):
         self.neighbor_index = neighbor_index
         self.V_self = V_self
         self.V_neighbor = V_neighbor
-        self.p = p+1
+        self.p = p
         self.min_similarity = min_similarity
         self.neighbor_sampling = neighbor_sampling
         self.neighbor_start_epoch = neighbor_start_epoch
         self._epoch: int = 0
+        self.neighbor_same_label_only = neighbor_same_label_only
+        # Per-sample labels for same-class filtering (small vs. mmap'd images)
+        self._labels: np.ndarray | None = None
+        if self.neighbor_same_label_only:
+            self._labels = np.asarray(self.ds["label"], dtype=np.int64)
+
+        if neighbor_start_epoch > 0 and V_neighbor > 0:
+            self.V_self_warmup = (
+                warmup_V_self if warmup_V_self is not None else V_self + V_neighbor
+            )
+        else:
+            self.V_self_warmup = V_self
 
         logger.info(
-            "MixedViewDataset: split=%s  N=%d  V_global=%d V_self=%d V_neighbor=%d  "
-            "p=%d  min_sim=%.2f  sampling=%s  neighbor_start_epoch=%d",
+            "NeighborViewDataset: split=%s  N=%d  V_global=%d V_self=%d V_neighbor=%d  "
+            "p=%d  min_sim=%.2f  sampling=%s  neighbor_start_epoch=%d  "
+            "V_self_warmup=%d (epochs < start)  same_label_neighbors=%s",
             split, len(self.ds), V_global, V_self, V_neighbor,
             p, min_similarity, neighbor_sampling, neighbor_start_epoch,
+            self.V_self_warmup,
+            neighbor_same_label_only,
         )
 
     # ------------------------------------------------------------------
@@ -173,12 +207,20 @@ class MixedViewDataset(HFDataset):
         # ── Global views from anchor ──────────────────────────────────
         global_views = [self.global_transform(img) for _ in range(self.V_global)]
 
-        # ── Self local views from anchor ──────────────────────────────
-        local_views = [self.local_transform(img) for _ in range(self.V_self)]
+        # ── Self local views (curriculum: more self-only during warmup) ─
+        if (
+            self.neighbor_start_epoch > 0
+            and self.V_neighbor > 0
+            and self._epoch < self.neighbor_start_epoch
+        ):
+            n_self = self.V_self_warmup
+        else:
+            n_self = self.V_self
+        local_views = [self.local_transform(img) for _ in range(n_self)]
 
         # ── Neighbor local views (curriculum: delayed introduction) ────
         if self.V_neighbor > 0 and self._epoch >= self.neighbor_start_epoch:
-            neighbor_views = self._sample_neighbor_views(idx)
+            neighbor_views = self._sample_neighbor_views(idx, label)
             local_views.extend(neighbor_views)
 
         return {
@@ -192,7 +234,7 @@ class MixedViewDataset(HFDataset):
     # Neighbor sampling
     # ------------------------------------------------------------------
 
-    def _sample_neighbor_views(self, idx: int) -> list[torch.Tensor]:
+    def _sample_neighbor_views(self, idx: int, anchor_label: int) -> list[torch.Tensor]:
         """Sample V_neighbor local views from the positive pool of *idx*.
 
         Falls back to self-augmentation if the pool is empty.
@@ -203,6 +245,14 @@ class MixedViewDataset(HFDataset):
 
         if len(nbr_idx) == 0:
             # No valid neighbors → fall back to self-augmentation
+            return [self.local_transform(self._load_image(self.ds[idx]))
+                    for _ in range(self.V_neighbor)]
+
+        if self.neighbor_same_label_only and self._labels is not None:
+            nbr_idx, nbr_sim = self._filter_same_label_pool(
+                nbr_idx, nbr_sim, anchor_label
+            )
+        if len(nbr_idx) == 0:
             return [self.local_transform(self._load_image(self.ds[idx]))
                     for _ in range(self.V_neighbor)]
 
@@ -226,6 +276,20 @@ class MixedViewDataset(HFDataset):
             rgb = img if img.mode == "RGB" else img.convert("RGB")
             views.append(self.local_transform(rgb))
         return views
+
+    def _filter_same_label_pool(
+        self,
+        nbr_idx: np.ndarray,
+        nbr_sim: np.ndarray,
+        anchor_label: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Keep only neighbors in the top-*p* pool whose label matches the anchor."""
+        assert self._labels is not None
+        if len(nbr_idx) == 0:
+            return nbr_idx, nbr_sim
+        lbl = self._labels[nbr_idx.astype(np.int64)]
+        mask = lbl == anchor_label
+        return nbr_idx[mask], nbr_sim[mask]
 
     def _choose_neighbors(
         self,
@@ -257,7 +321,6 @@ class MixedViewDataset(HFDataset):
 
         return chosen
 
-
 # ---------------------------------------------------------------------------
 # Collate function
 # ---------------------------------------------------------------------------
@@ -266,7 +329,7 @@ def collate_mixed_views(
     batch: list[dict],
     include_index: bool = False,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """Collate a list of ``MixedViewDataset.__getitem__`` dicts.
+    """Collate a list of ``NeighborViewDataset.__getitem__`` dicts.
 
     Produces the same ``(List[(B,C,H,W)], labels)`` tuple as ``collate_views``
     so it is a drop-in replacement for ``BaseTrainer.train_dataloader``'s
@@ -279,7 +342,7 @@ def collate_mixed_views(
     Parameters
     ----------
     batch:
-        List of dicts from ``MixedViewDataset.__getitem__``.
+        List of dicts from ``NeighborViewDataset.__getitem__``.
     include_index:
         If True, the second element of the returned tuple becomes a dict
         ``{"labels": Tensor, "indices": Tensor}`` instead of a plain label

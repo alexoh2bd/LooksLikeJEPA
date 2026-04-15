@@ -1,5 +1,7 @@
-
+import ctypes
+import logging
 import torch
+import torch.multiprocessing as mp
 # import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
@@ -7,6 +9,57 @@ from datasets import load_dataset
 
 import random
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def _load_hf_split(dataset: str, split: str):
+    """Load a single HF split (parquet hub paths or CIFAR-10). Used by HFDataset and cache prep."""
+    if dataset == "cifar10":
+        return load_dataset("cifar10", split=split)
+    if dataset == "inet100":
+        inet_dir = (
+            "/home/users/aho13/jepa_tests/data/cache/datasets--clane9--imagenet-100/"
+            "snapshots/0519dc2f402a3a18c6e57f7913db059215eee25b/data/"
+        )
+        filenames = {
+            "train": inet_dir + "train-*.parquet",
+            "val": inet_dir + "validation*.parquet",
+        }
+        return load_dataset("parquet", data_files=filenames, split=split)
+    if dataset == "imagenet-1k":
+        inet_dir = (
+            "/home/users/aho13/jepa_tests/data/hub/datasets--ILSVRC--imagenet-1k/"
+            "snapshots/49e2ee26f3810fb5a7536bbf732a7b07389a47b5/data"
+        )
+        filenames = {
+            "train": inet_dir + "/train*.parquet",
+            "val": inet_dir + "/validation*.parquet",
+            "test": inet_dir + "/test*.parquet",
+        }
+        return load_dataset("parquet", data_files=filenames, split=split)
+    raise ValueError(f"Dataset {dataset} not supported")
+
+
+def prepare_hf_dataset_cache(dataset: str) -> None:
+    """Populate HF Datasets cache for train + eval splits.
+
+    Call from **local rank 0** on each node, then ``torch.distributed.barrier()`` so other
+    ranks do not run concurrent ``load_dataset`` / cache writes on NFS or shared
+    node-local ``HF_DATASETS_CACHE`` (avoids stale handles and lock contention).
+    """
+    if dataset == "cifar10":
+        splits = ("train", "test")
+    else:
+        splits = ("train", "val")
+    logger.info(
+        "prepare_hf_dataset_cache: loading splits %s for dataset=%s",
+        splits,
+        dataset,
+    )
+    for sp in splits:
+        _ = _load_hf_split(dataset, sp)
+    logger.info("prepare_hf_dataset_cache: done for dataset=%s", dataset)
 
 
 def collate_views(batch):
@@ -55,26 +108,44 @@ def collate_views(batch):
 
 
 class HFDataset(Dataset):
-    def __init__(self, split, V_global=2, V_local=4, device="cuda", global_img_size=224, local_img_size=96, dataset="inet100",seed=0):
+    def __init__(
+        self,
+        split,
+        V_global=2,
+        V_local=4,
+        device="cuda",
+        global_img_size=224,
+        local_img_size=96,
+        dataset="inet100",
+        seed=0,
+        global_rrc_min=0.3,
+        global_rrc_max=1.0,
+        local_rrc_min=0.05,
+        local_rrc_max=0.3,
+    ):
         self.V_global = V_global
         self.V_local = V_local
         self.split = split
         self.global_img_size = global_img_size
         self.local_img_size = local_img_size
-        self.seed=seed
+        self.seed = seed
         self._get_ds(dataset)
         
         # 2. Define Transforms
-        # Global Views: 224x224
+        # Global Views: e.g. 224x224, RRC scale (default ViT-style 0.3–1.0; LpJEPA L.3 uses 0.2–1.0)
         self.global_transform = v2.Compose([
-            v2.RandomResizedCrop(self.global_img_size, scale=(0.3, 1.0)),
+            v2.RandomResizedCrop(
+                self.global_img_size, scale=(float(global_rrc_min), float(global_rrc_max))
+            ),
             v2.RandomHorizontalFlip(p=0.5),
             v2.ToImage(),
         ])
         
-        # Local Views: 96x96
+        # Local Views: e.g. 96x96
         self.local_transform = v2.Compose([
-            v2.RandomResizedCrop(self.local_img_size, scale=(0.05, 0.3)),
+            v2.RandomResizedCrop(
+                self.local_img_size, scale=(float(local_rrc_min), float(local_rrc_max))
+            ),
             v2.RandomHorizontalFlip(p=0.5),
             v2.ToImage(),
         ])
@@ -88,26 +159,7 @@ class HFDataset(Dataset):
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     def _get_ds(self, dataset):
-        if dataset == "cifar10":
-            self.ds = load_dataset("cifar10", split=self.split)
-        elif dataset == "inet100":
-            self.inet_dir = "/home/users/aho13/jepa_tests/data/cache/datasets--clane9--imagenet-100/snapshots/0519dc2f402a3a18c6e57f7913db059215eee25b/data/"
-            filenames = {
-                "train": self.inet_dir + "train-*.parquet",
-                "val": self.inet_dir + "validation*.parquet",
-            }
-            self.ds = load_dataset("parquet", data_files=filenames, split=self.split)
-        elif dataset=="imagenet-1k":
-            self.inet_dir = "/home/users/aho13/jepa_tests/data/hub/datasets--ILSVRC--imagenet-1k/snapshots/49e2ee26f3810fb5a7536bbf732a7b07389a47b5/data"
-            
-            filenames = {
-                "train": self.inet_dir + "/train*.parquet",
-                "val": self.inet_dir + "/validation*.parquet",
-                "test": self.inet_dir + "/test*.parquet",
-            }
-            self.ds = load_dataset("parquet", data_files=filenames, split=self.split)
-        else:
-            raise ValueError(f"Dataset {dataset} not supported")
+        self.ds = _load_hf_split(dataset, self.split)
 
     def _load_image(self, entry):
         """Helper to handle safe image extraction from row entry."""
@@ -152,7 +204,11 @@ class CrossInstanceDataset(HFDataset):
         local_img_size=96,
         part_upload=False,
         dataset="inet100",
-        seed=0
+        seed=0,
+        global_rrc_min=0.3,
+        global_rrc_max=1.0,
+        local_rrc_min=0.05,
+        local_rrc_max=0.3,
     ):
         # Initialize parent (Handles loading DS, transforms, V_global/V_local)
         super().__init__(
@@ -161,15 +217,32 @@ class CrossInstanceDataset(HFDataset):
             V_local=V_local,
             global_img_size=global_img_size,
             local_img_size=local_img_size,
-            dataset=dataset
+            dataset=dataset,
+            seed=seed,
+            global_rrc_min=global_rrc_min,
+            global_rrc_max=global_rrc_max,
+            local_rrc_min=local_rrc_min,
+            local_rrc_max=local_rrc_max,
         )
-        self.rng=np.random.default_rng(self.seed)
+        # Shared-memory counter so on_train_epoch_start updates are visible to
+        # persistent DataLoader workers (separate OS processes after fork).
+        self._shared_epoch = mp.Value(ctypes.c_int, 0)
+        # Set by trainer before workers are forked (in train_dataloader).
+        self._rank = 0
         self.V_mixed = V_mixed
         self.label_to_indices = None
 
         # Build fast index mapping if training with mixed views
         if self.split == "train" and self.V_mixed > 0:
             self._build_label_index()
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update the epoch counter visible to all persistent DataLoader workers."""
+        self._shared_epoch.value = epoch
+
+    def set_rank(self, rank: int) -> None:
+        """Set the global DDP rank; must be called before workers are forked."""
+        self._rank = rank
 
     def _build_label_index(self):
         """Build numpy arrays for O(1) random sampling per class."""
@@ -196,12 +269,16 @@ class CrossInstanceDataset(HFDataset):
             return views, label
 
         # 3. Generate Mixed Views (Same Class, Different Instance)
-        # Fast numpy random sampling - much faster than random.sample()
         class_indices = self.label_to_indices[label]
         class_size = len(class_indices)
-        
-        # Use numpy randint + fancy indexing (faster than random.sample)
-        rand_positions = self.rng.integers(0, class_size, size=self.V_mixed)
+
+        # Per-item deterministic seed: reproducible for any (item, epoch, rank) triple.
+        # No stateful RNG — safe for persistent workers and any DDP configuration.
+        # _shared_epoch is an mp.Value so main-process set_epoch() calls are
+        # immediately visible to forked worker processes via OS shared memory.
+        epoch = self._shared_epoch.value
+        item_rng = np.random.default_rng([i, epoch, self._rank])
+        rand_positions = item_rng.integers(0, class_size, size=self.V_mixed)
         mixed_indices = class_indices[rand_positions].tolist()
         
         # Batch fetch entries (single I/O call)

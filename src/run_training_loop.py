@@ -10,9 +10,24 @@ Usage (LeJEPA – Table 2 replication):
         +lr=5e-4 +weight_decay=1e-2 \\
         +V_global=2 +V_local=6 +V_mixed=0 \\
         +lamb=0.05 +use_swa=False
+
+Author-style SIGReg (``SlicedEppsPulley`` from ``losses/lejepa.py``; loss is always
+``inv_loss + lamb * sigreg_loss`` like stable-pretraining)::
+
+    +sigreg_impl=author \\
+    +sigreg_n_slices=1024 +sigreg_t_max=3.0 +sigreg_n_points=17
+
+``compute_author_lejepa_loss`` lives in ``losses/loss.py``; it calls
+``sliced_ep(all_views.flatten(0,1))`` once per step like the reference ``_compute_loss``.
 """
 import os
 import torch
+from torch import _dynamo
+
+# torch.compile + DDP: Dynamo's DDPOptimizer rejects some graphs (PyTorch #104674).
+# Must set at import time — Lightning DDP worker processes do not re-run main().
+_dynamo.config.optimize_ddp = False
+
 import logging
 import hydra
 from omegaconf import DictConfig
@@ -23,6 +38,7 @@ import warnings
 warnings.filterwarnings("ignore", message="Corrupt EXIF data.*", category=UserWarning)
 from trainer import TrainerConfig, SimCLRTrainer, JEPATrainer, LpJEPATrainer
 from encoder import Encoder
+from losses.lejepa import LeJEPA as AuthorLeJEPA
 
 
 logging.basicConfig(level=logging.INFO)
@@ -55,9 +71,30 @@ def main(cfg: DictConfig):
     # Build config from hydra
     config = TrainerConfig.from_hydra(cfg)
     config.reproducible = reproducible
-    
+
     # Create encoder
-    encoder = Encoder(model_name=config.model_name, proj_dim=config.proj_dim)
+    # Use author's LeJEPA module (backbone + projector + _compute_loss) when reg=LeJEPA
+    # and sigreg_impl=author.  All other methods (SimCLR, LpJEPA, hybrid) keep Encoder.
+    _use_author_lejepa = (
+        cfg.get("reg", "LeJEPA") == "LeJEPA"
+        and str(cfg.get("sigreg_impl", "author")).lower() == "author"
+    )
+    if _use_author_lejepa:
+        encoder = AuthorLeJEPA(
+            encoder_name=config.model_name,
+            proj_dim=config.proj_dim,
+            n_slices=config.sigreg_n_slices,
+            t_max=config.sigreg_t_max,
+            n_points=config.sigreg_n_points,
+            lamb=cfg.get("lamb", 0.05),
+            drop_path_rate=0.1,
+        )
+    else:
+        encoder = Encoder(
+            model_name=config.model_name,
+            proj_dim=config.proj_dim,
+            torch_compile=config.torch_compile,
+        )
     if cfg.get("phn", False):
         config.phn_neighbor_indices_path = cfg.get("phn_neighbor_indices_path", "")
         config.phn_neighbor_scores_path  = cfg.get("phn_neighbor_scores_path", "")
@@ -67,6 +104,10 @@ def main(cfg: DictConfig):
         config.phn_neighbor_sampling     = cfg.get("phn_neighbor_sampling", "uniform")
         config.phn_pos_only              = cfg.get("phn_pos_only", False)
         config.phn_neighbor_start_epoch  = cfg.get("phn_neighbor_start_epoch", 0)
+        config.phn_warmup_V_local        = cfg.get("phn_warmup_V_local", None)
+        config.phn_neighbor_same_label_only = cfg.get(
+            "phn_neighbor_same_label_only", False
+        )
 
 
     # Create model based on method type
@@ -101,17 +142,19 @@ def main(cfg: DictConfig):
         )
     else:
         raise ValueError(f"Unknown method: {reg}")
-    v_neighbor = getattr(config, "V_neighbor", 0)
+    v_neighbor = cfg.get("V_neighbor", 0)
     save_prefix = (
         f"{model.get_method_name()}_{config.dataset}/"
         f"LV{config.V_local}_MV{config.V_mixed}"
         + (f"_NV{v_neighbor}_QwenP{config.phn_p}" if v_neighbor else "")
         + f"_BS{config.bs * config.grad_accum}_e{config.epochs}"
-        + (f"_ddp6" if config.distributed else "") 
+        + "_1"
+        + (f"_ddp13" if config.distributed else "")
     )
     logging.info(f"save_prefix: {save_prefix}")
     ckpt_dir=f"data/checkpoints/{save_prefix}"
     # Setup callbacks
+    ckpt_every_n = cfg.get("ckpt_every_n_epochs", 2)
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="{epoch}-{val/acc:.3f}",
@@ -119,12 +162,14 @@ def main(cfg: DictConfig):
         mode="max",
         save_top_k=2,
         save_last=True,
-        every_n_epochs=None,
+        every_n_epochs=ckpt_every_n,
     )
     
     lr_monitor = LearningRateMonitor(logging_interval='step')
     
-    # Setup logger
+    # In run_training_loop.py, before constructing WandbLogger
+
+
     wandb_logger = WandbLogger(
         project="VIT_JEPA_Views",
         entity="aho13-duke-university",
@@ -141,15 +186,15 @@ def main(cfg: DictConfig):
     # phn_pos_only uses PosBatchSampler which handles DDP; do not add DistributedSampler
     phn_pos_only = cfg.get("phn_pos_only", True)
     use_dist_sampler = use_ddp and not (cfg.get("phn", False) and phn_pos_only)
+    grad_clip = cfg.get("gradient_clip_val", 1.0)
     trainer = L.Trainer(
         max_epochs=config.epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=ndevices if use_ddp else 1,
-        check_val_every_n_epoch=4,  # validate every 4 epochs
+        check_val_every_n_epoch=ckpt_every_n,
         strategy="ddp" if use_ddp else "auto",
         precision="bf16-mixed",
         accumulate_grad_batches=config.grad_accum,
-        gradient_clip_val=config.max_grad_norm,
         log_every_n_steps=config.log_interval,
         callbacks=[checkpoint_callback, lr_monitor],
         logger=wandb_logger,
@@ -158,12 +203,18 @@ def main(cfg: DictConfig):
         num_nodes=num_nodes,
         use_distributed_sampler=use_dist_sampler,
         sync_batchnorm=use_ddp,
+        gradient_clip_val=grad_clip,
+        gradient_clip_algorithm="norm",
     )
-    last_ckpt=f"data/checkpoints/{save_prefix}/last.ckpt"
+    last_ckpt = f"data/checkpoints/{save_prefix}/last.ckpt"
+    init_ckpt = cfg.get("init_ckpt", None)
+    resume_ckpt = init_ckpt or (last_ckpt if os.path.exists(last_ckpt) else None)
+    if resume_ckpt:
+        logging.info("Resuming from checkpoint: %s", resume_ckpt)
 
     torch.serialization.add_safe_globals([TrainerConfig])
     # Train the model
-    trainer.fit(model, ckpt_path=last_ckpt if os.path.exists(last_ckpt) else None)
+    trainer.fit(model, ckpt_path=resume_ckpt)
 
     if checkpoint_callback.best_model_path:
         logging.info(f"Best checkpoint saved to: {checkpoint_callback.best_model_path}")

@@ -5,7 +5,7 @@ from torchvision.ops import MLP
 
 # ── Paper model presets (Table 2) ───────────────────────────────────────────
 MODEL_VIT_L = "vit_large_patch16_224"        # ~304M params
-MODEL_CONVNEXTV2_H = "convnextv2_huge"      # ~660M params
+# MODEL_CONVNEXTV2_H = "convnextv2_huge"      # ~660M params
 
 
 def _is_vit(name: str) -> bool:
@@ -20,7 +20,7 @@ class Encoder(nn.Module):
     ViT-specific options (dynamic_img_size, reg_tokens) are applied only
     when the backbone is a ViT variant.
     """
-    def __init__(self, model_name=MODEL_VIT_L, proj_dim=512):
+    def __init__(self, model_name=MODEL_VIT_L, proj_dim=512, torch_compile: bool = True):
         super().__init__()
         
         cfg = {
@@ -38,22 +38,24 @@ class Encoder(nn.Module):
 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        
-        self.backbone = torch.compile(
-            self.backbone,
-            mode="reduce-overhead",
-        )
+
+        # First torch.compile pass (per submodule). BaseTrainer compiles the full Encoder again
+        # when config.torch_compile — intentional double-compile for whole-module graphs.
+        # if torch_compile:
+        #     self.backbone = torch.compile(
+        #         self.backbone,
+        #         mode="reduce-overhead",
+        #     )
 
         self.feat_dim = self.backbone.num_features
+
         self.proj = MLP(
             in_channels=self.feat_dim, 
             hidden_channels=[2048, 2048, proj_dim], 
             norm_layer=nn.BatchNorm1d
         )
-        self.proj = torch.compile(self.proj, mode="default")
-        self.output_bn = nn.BatchNorm1d(proj_dim, affine=False)
-        self.output_bn = nn.SyncBatchNorm.convert_sync_batchnorm(self.output_bn)
-        self.output_bn.float()
+        # if torch_compile:
+        #     self.proj = torch.compile(self.proj, mode="default")
 
     def forward(self, x_list, unnorm=False):
         """
@@ -80,7 +82,6 @@ class Encoder(nn.Module):
             # backbone(flattened) -> (N*Vg, feature_dim)
             emb_g = self.backbone(g_imgs.flatten(0, 1)) 
             proj_g = self.proj(emb_g) # (N*Vg, proj_dim)
-            proj_g = self.output_bn(proj_g)
             
             # Reshape back to (N, Vg, D)
             proj_g = proj_g.reshape(N, Vg, -1)
@@ -98,7 +99,6 @@ class Encoder(nn.Module):
             # backbone(flattened) -> (N*Vl, feature_dim)
             emb_l = self.backbone(l_imgs.flatten(0, 1))
             proj_l = self.proj(emb_l) # (N*Vl, proj_dim)
-            proj_l = self.output_bn(proj_l)
             
             # Reshape back to (N, Vl, D)
             proj_l = proj_l.reshape(N, Vl, -1)
