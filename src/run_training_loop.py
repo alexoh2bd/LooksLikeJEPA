@@ -142,7 +142,7 @@ def main(cfg: DictConfig):
         )
     else:
         raise ValueError(f"Unknown method: {reg}")
-    v_neighbor = getattr(config, "V_neighbor", 0)
+    v_neighbor = cfg.get("V_neighbor", 0)
     save_prefix = (
         f"{model.get_method_name()}_{config.dataset}/"
         f"LV{config.V_local}_MV{config.V_mixed}"

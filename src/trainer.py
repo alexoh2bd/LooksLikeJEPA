@@ -62,6 +62,26 @@ def _make_worker_init_fn(base_seed: int):
 
     return init_fn
 
+def _make_cross_instance_worker_init_fn(base_seed: int):
+    """Seed worker-level RNGs (torch, numpy legacy, random) per (rank, worker_id).
+
+    CrossInstanceDataset partner selection is now fully deterministic per
+    (item_index, epoch, rank) via np.random.default_rng([i, epoch, rank]) in
+    __getitem__ — no stateful self.rng is used there. This function seeds the
+    remaining worker-level RNG sources (torchvision augmentation transforms, etc.)
+    so that augmentation is also unique per rank × worker.
+    """
+    def init_fn(worker_id: int) -> None:
+        import numpy as np
+        import random
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        # Multiplier 10_000 > max num_workers so seeds never collide across ranks.
+        unique_seed = base_seed + rank * 10_000 + worker_id
+        np.random.seed(unique_seed & 0xFFFF_FFFF)
+        random.seed(unique_seed)
+        torch.manual_seed(unique_seed)
+    return init_fn
+
 
 @dataclass
 class TrainerConfig:
@@ -102,6 +122,7 @@ class TrainerConfig:
     V_global: int = 2
     V_local: int = 6
     V_mixed: int = 0
+    V_neighbor: int = 0
     global_img_size: int = 224
     local_img_size: int = 98
     
@@ -166,7 +187,7 @@ class TrainerConfig:
             V_global=cfg.get("V_global", 2),
             V_local=cfg.get("V_local", 6),
             V_mixed=cfg.get("V_mixed", 0),
-            V_neighbor=cfg.get("V_neighbor", 0)
+            V_neighbor=cfg.get("V_neighbor", 0),
             global_img_size=cfg.get("global_img_size", 224),
             local_img_size=cfg.get("local_img_size", 98),
             device=cfg.get("device", "cuda"),
@@ -533,7 +554,13 @@ class BaseTrainer(L.LightningModule):
             prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
             collate_fn=collate_views,
         )
-        if getattr(cfg, "reproducible", False) and cfg.num_workers > 0:
+        if isinstance(self.train_ds, CrossInstanceDataset):
+            # set_rank must happen before workers fork so _rank is correct in __getitem__.
+            rank = self.trainer.global_rank if self.trainer is not None else 0
+            self.train_ds.set_rank(rank)
+            if cfg.num_workers > 0:
+                kw["worker_init_fn"] = _make_cross_instance_worker_init_fn(cfg.seed)
+        elif getattr(cfg, "reproducible", False) and cfg.num_workers > 0:
             kw["worker_init_fn"] = _make_worker_init_fn(cfg.seed)
         return DataLoader(self.train_ds, **kw)
 
@@ -553,7 +580,7 @@ class BaseTrainer(L.LightningModule):
             drop_last=bool(cfg.val_drop_last),
             num_workers=cfg.num_workers,
             pin_memory=True,
-            persistent_workers=cfg.num_workers > 0,
+            # persistent_workers=cfg.num_workers > 0,
             prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         )
         if getattr(cfg, "reproducible", False) and cfg.num_workers > 0:
@@ -592,7 +619,11 @@ class BaseTrainer(L.LightningModule):
                         path = os.path.join(ckpt_dir, f"epoch_{start_epoch}_pre_phn.ckpt")
                         self.trainer.save_checkpoint(path)
                         logging.info("Saved pre-PHN checkpoint to %s", path)
-    
+        if isinstance(self.train_ds, CrossInstanceDataset):
+            # Update shared-memory epoch counter so persistent worker processes
+            # see the new epoch in __getitem__ without being respawned.
+            self.train_ds.set_epoch(self.current_epoch)
+
     def _build_gpu_aug_global(self) -> v2.Compose:
         """Build GPU augmentation pipeline for global views."""
         sp = float(self.config.solarize_p)

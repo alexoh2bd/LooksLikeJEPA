@@ -1,5 +1,7 @@
+import ctypes
 import logging
 import torch
+import torch.multiprocessing as mp
 # import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
@@ -222,13 +224,25 @@ class CrossInstanceDataset(HFDataset):
             local_rrc_min=local_rrc_min,
             local_rrc_max=local_rrc_max,
         )
-        self.rng=np.random.default_rng(self.seed)
+        # Shared-memory counter so on_train_epoch_start updates are visible to
+        # persistent DataLoader workers (separate OS processes after fork).
+        self._shared_epoch = mp.Value(ctypes.c_int, 0)
+        # Set by trainer before workers are forked (in train_dataloader).
+        self._rank = 0
         self.V_mixed = V_mixed
         self.label_to_indices = None
 
         # Build fast index mapping if training with mixed views
         if self.split == "train" and self.V_mixed > 0:
             self._build_label_index()
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update the epoch counter visible to all persistent DataLoader workers."""
+        self._shared_epoch.value = epoch
+
+    def set_rank(self, rank: int) -> None:
+        """Set the global DDP rank; must be called before workers are forked."""
+        self._rank = rank
 
     def _build_label_index(self):
         """Build numpy arrays for O(1) random sampling per class."""
@@ -255,12 +269,16 @@ class CrossInstanceDataset(HFDataset):
             return views, label
 
         # 3. Generate Mixed Views (Same Class, Different Instance)
-        # Fast numpy random sampling - much faster than random.sample()
         class_indices = self.label_to_indices[label]
         class_size = len(class_indices)
-        
-        # Use numpy randint + fancy indexing (faster than random.sample)
-        rand_positions = self.rng.integers(0, class_size, size=self.V_mixed)
+
+        # Per-item deterministic seed: reproducible for any (item, epoch, rank) triple.
+        # No stateful RNG — safe for persistent workers and any DDP configuration.
+        # _shared_epoch is an mp.Value so main-process set_epoch() calls are
+        # immediately visible to forked worker processes via OS shared memory.
+        epoch = self._shared_epoch.value
+        item_rng = np.random.default_rng([i, epoch, self._rank])
+        rand_positions = item_rng.integers(0, class_size, size=self.V_mixed)
         mixed_indices = class_indices[rand_positions].tolist()
         
         # Batch fetch entries (single I/O call)
