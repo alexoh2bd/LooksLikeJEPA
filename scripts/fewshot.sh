@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=fewshot
-#SBATCH --output=logs/%x_%j.log
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=log/%x/%j.log
+#SBATCH --error=log/%x/%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
 #SBATCH --time=24:00:00
-#SBATCH --gres=gpu:a5000:1
+#SBATCH --gres=gpu:rtx_pro_6000:1
 
 
 # Fail fast
@@ -59,8 +59,12 @@ python --version
 
 # --model_name must match the checkpoint backbone (e.g. vit_large_patch16_224 for /16 runs).
 # --skip_imagenet1k_full: few-shot Table-2 eval only; omit to also run full IN-1K val top-1 (needs parquet).
+export PYTHONPATH="${PWD}/stable-pretraining${PYTHONPATH:+:${PYTHONPATH}}"
+
+
+
 uv run python src/linear_probe.py \
-    --checkpoint_path data/checkpoints/LeJEPA_imagenet-1k/LV4_MV2_BS512_e100_ddp7/last.ckpt \
+    --checkpoint_path data/checkpoints/LeJEPA_imagenet-1k/LV6_MV0_BS512_e100_1_ddp13/last.ckpt \
     --model_name vit_large_patch14_224 \
     --proj_dim 512 \
     --datasets dtd cifar10 cifar100 flowers102 food101 pets cars \
@@ -72,11 +76,12 @@ uv run python src/linear_probe.py \
     --batch_size 512 \
     --device cuda \
     --wandb_project fewshot-JEPA \
+    --use_k_shot \
     --skip_imagenet1k_full
 
 
 uv run python src/linear_probe.py \
-    --checkpoint_path data/checkpoints/LeJEPA_imagenet-1k/LV4_MV0_NV2_QwenP64_BS512_e100_ddp7/last.ckpt \
+    --checkpoint_path data/checkpoints/LeJEPA_imagenet-1k/LV5_MV1_BS512_e100_1z_ddp13/last.ckpt \
     --model_name vit_large_patch14_224 \
     --proj_dim 512 \
     --datasets dtd cifar10 cifar100 flowers102 food101 pets cars \
@@ -88,4 +93,5 @@ uv run python src/linear_probe.py \
     --batch_size 512 \
     --device cuda \
     --wandb_project fewshot-JEPA \
+    --use_k_shot \
     --skip_imagenet1k_full
