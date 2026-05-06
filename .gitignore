@@ -15,4 +15,6 @@
 *.nsys-rep
 *__pycache__
 *.sh
-/stable-pretraining
+/stable-pretraining/
+
+/stable*

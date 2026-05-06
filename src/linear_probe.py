@@ -156,7 +156,9 @@ IMAGENET1K_NUM_CLASSES = 1000
 # Paper: linear probe always trained for 100 epochs.
 PROBE_EPOCHS = 100
 
-# CLI integers 1 and 10 denote 1% and 10% of stratified training labels (not k-shot counts).
+# Default: CLI integers 1 and 10 are 1%% / 10%% stratified train fractions. With
+# ``--use_k_shot``, integer regimes instead select that many labels per class via
+# ``k_shot_subset`` (LABEL_FRAC is unused).
 LABEL_FRAC = {1: 0.01, 10: 0.10}
 
 
@@ -774,8 +776,14 @@ def main():
         type=str,
         nargs="+",
         default=["1", "10", "all"],
-        help="1 → 1%% train, 10 → 10%% train, all → 100%% (stratified per class). "
-        "Alias: --k_shot (legacy name).",
+        help="Integers: per-class shot count if --use_k_shot, else 1→1%% / 10→10%% of "
+        "train (stratified). 'all' → 100%% train. Alias: --k_shot (legacy name).",
+    )
+    parser.add_argument(
+        "--use_k_shot",
+        action="store_true",
+        help="Subsample with k_shot_subset: each integer regime is k labeled examples "
+        "per class (not a fraction of train).",
     )
     parser.add_argument(
         "--seeds", type=int, nargs="+", default=[0, 1, 2],
@@ -816,7 +824,7 @@ def main():
     import wandb
     args = parser.parse_args()
 
-    # Regimes: 1 → 1%, 10 → 10%, all → 100% of labeled training data
+    # Regimes: int → fraction (default) or k-shot per class (--use_k_shot); all → full train
     k_values: list = []
     for r in args.label_regimes:
         k_values.append("all" if r == "all" else int(r))
@@ -834,6 +842,10 @@ def main():
         entity="aho13-duke-university",
         name=run_name,
         config=wandb_cfg,
+    )
+    logger.info(
+        "Label subset mode: %s",
+        "k-shot (per class)" if args.use_k_shot else "fraction of train (per class)",
     )
 
     if args.device == "cuda" and torch.cuda.is_available():
@@ -885,25 +897,46 @@ def main():
                 wandb.log({f"{ds_name}/{tag}/seed0_acc": round(acc * 100, 2)})
 
             else:
-                if k not in LABEL_FRAC:
+                if args.use_k_shot:
+                    if not isinstance(k, int) or k < 1:
+                        raise ValueError(
+                            f"Unsupported regime {k!r}; use a positive integer "
+                            "(shots per class) or all."
+                        )
+                elif k not in LABEL_FRAC:
                     raise ValueError(
                         f"Unsupported regime {k!r}; use 1 (1%%), 10 (10%%), or all (100%%)."
                     )
-                frac = LABEL_FRAC[k]
+                frac = None if args.use_k_shot else LABEL_FRAC[k]
                 tag = log_key(k)
                 seed_accs = []
                 for seed in args.seeds:
-                    sub_feats, sub_labels = fraction_subset(
-                        train_feats, train_labels, frac, seed=seed,
-                    )
-                    logger.info(
-                        "  %s (frac=%.4f) seed=%d  n_train=%d  probe_epochs=%d",
-                        tag,
-                        frac,
-                        seed,
-                        sub_feats.shape[0],
-                        PROBE_EPOCHS,
-                    )
+                    if args.use_k_shot:
+                        sub_feats, sub_labels = k_shot_subset(
+                            train_feats, train_labels, k, seed=seed,
+                        )
+                    else:
+                        sub_feats, sub_labels = fraction_subset(
+                            train_feats, train_labels, frac, seed=seed,
+                        )
+                    if args.use_k_shot:
+                        logger.info(
+                            "  %s (k_shot=%d) seed=%d  n_train=%d  probe_epochs=%d",
+                            tag,
+                            k,
+                            seed,
+                            sub_feats.shape[0],
+                            PROBE_EPOCHS,
+                        )
+                    else:
+                        logger.info(
+                            "  %s (frac=%.4f) seed=%d  n_train=%d  probe_epochs=%d",
+                            tag,
+                            frac,
+                            seed,
+                            sub_feats.shape[0],
+                            PROBE_EPOCHS,
+                        )
                     acc = train_linear_probe(
                         sub_feats,
                         sub_labels,

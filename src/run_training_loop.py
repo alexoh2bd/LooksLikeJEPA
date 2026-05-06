@@ -148,7 +148,7 @@ def main(cfg: DictConfig):
         f"LV{config.V_local}_MV{config.V_mixed}"
         + (f"_NV{v_neighbor}_QwenP{config.phn_p}" if v_neighbor else "")
         + f"_BS{config.bs * config.grad_accum}_e{config.epochs}"
-        + "_1"
+        + "_1z"
         + (f"_ddp13" if config.distributed else "")
     )
     logging.info(f"save_prefix: {save_prefix}")

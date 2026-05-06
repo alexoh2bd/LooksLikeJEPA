@@ -1,12 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=ddp_train
-#SBATCH --output=logs/%x_%j.log
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --job-name=ddp_i1k
+#SBATCH --output=log/%x/%j.log
+#SBATCH --error=log/%x/%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=320:00:00
+#SBATCH --cpus-per-task=7
+# ViT-L + ImageNet + DataLoader can exceed 64G RSS (sacct MaxRSS ~50–70G observed) — OOM kills look like FAILED 135 / step CANCELLED.
+#SBATCH --mem=128G
+#SBATCH --time=120:00:00
 #SBATCH --partition=compsci-gpu
 #SBATCH --gres=gpu:rtx_pro_6000:2
 
@@ -15,10 +16,29 @@
 # ===========================================================================
 set -e
 
+# Project root: sbatch spools this script; training uses relative src/...
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  cd "$SLURM_SUBMIT_DIR" || exit 1
+else
+  SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  cd "$SCRIPT_DIR/.." || exit 1
+fi
+
+# Do not use .venv/bin/python directly: it is often a symlink to ~/.local/share/uv/python/...
+# which may be missing on compute nodes or after uv cache cleanup ("No such file or directory").
+# `uv run python` resolves/fetches an interpreter from pyproject.toml (same as scripts/train.sh).
+export PATH="${HOME}/.local/bin:${PATH}"
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: uv not in PATH (expected e.g. ${HOME}/.local/bin/uv)" >&2
+  exit 1
+fi
+
+# Vendored submodule is not a published wheel — expose package `stable_pretraining` on PYTHONPATH.
+export PYTHONPATH="${PWD}/stable-pretraining${PYTHONPATH:+:${PYTHONPATH}}"
+
 # ===========================================================================
 # Environment
 # ===========================================================================
-source /home/users/aho13/jepa_tests/.venv/bin/activate
 
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
@@ -49,6 +69,8 @@ export NCCL_SOCKET_IFNAME=^docker0,lo
 export NCCL_TIMEOUT=3600
 export NCCL_DEBUG=INFO                     # INFO for first run to verify IB; switch to WARN after
 
+
+
 # --- OPTION B: TCP fallback (reliable, slower) ---
 # Uncomment these and comment out Option A if InfiniBand hangs.
 # export NCCL_IB_DISABLE=1
@@ -78,8 +100,8 @@ echo "Nodes: $SLURM_NODELIST"
 echo "Tasks per node: $SLURM_NTASKS_PER_NODE"
 echo "Host: $(hostname)"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
-which python
-python --version
+uv run python -c "import stable_pretraining; print('stable_pretraining OK')"
+uv run python --version
 
 
 srun uv run python src/run_training_loop.py \
@@ -92,18 +114,18 @@ srun uv run python src/run_training_loop.py \
   +weight_decay=5e-2 \
   +lamb=0.02 \
   +V_global=2 \
-  +V_local=6\
-  +V_mixed=0 \
+  +V_local=5\
+  +V_mixed=1 \
   +global_img_size=224 \
   +local_img_size=98 \
   +proj_dim=512 \
   +grad_accum=1 \
-  +num_workers=7 \
+  +num_workers=6 \
   +prefetch_factor=2 \
   +device=cuda \
   +distributed=True \
-  +world_size=2\
-  +num_nodes=1\
+  +world_size=2 \
+  +num_nodes=1 \
   +seed=0 \
   +log_interval=50 \
   +use_swa=False \
@@ -131,7 +153,7 @@ srun uv run python src/run_training_loop.py \
 #   +weight_decay=5e-2 \
 #   +lamb=0.05 \
 #   +V_global=2 \
-#   +V_local=6\
+#   +V_local=6 \
 #   +V_mixed=0 \
 #   +global_img_size=224 \
 #   +local_img_size=98 \
